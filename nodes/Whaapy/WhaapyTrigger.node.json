@@ -1,0 +1,22 @@
+{
+  "node": "n8n-nodes-base.whaapyTrigger",
+  "nodeVersion": "1.0",
+  "codexVersion": "1.0",
+  "categories": ["Communication", "Marketing & Content"],
+  "resources": {
+    "credentialDocumentation": [
+      {
+        "url": "https://docs.whaapy.com/api-reference/authentication"
+      }
+    ],
+    "primaryDocumentation": [
+      {
+        "url": "https://docs.whaapy.com/api-reference/webhooks"
+      }
+    ]
+  },
+  "alias": ["whatsapp", "wa", "messaging", "webhook", "trigger"],
+  "subcategories": {
+    "Communication": ["SMS & Messaging"]
+  }
+}

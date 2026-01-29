@@ -1,0 +1,22 @@
+{
+  "node": "n8n-nodes-base.whaapy",
+  "nodeVersion": "1.0",
+  "codexVersion": "1.0",
+  "categories": ["Communication", "Marketing & Content"],
+  "resources": {
+    "credentialDocumentation": [
+      {
+        "url": "https://docs.whaapy.com/api-reference/authentication"
+      }
+    ],
+    "primaryDocumentation": [
+      {
+        "url": "https://docs.whaapy.com"
+      }
+    ]
+  },
+  "alias": ["whatsapp", "wa", "messaging", "chat", "sms"],
+  "subcategories": {
+    "Communication": ["SMS & Messaging"]
+  }
+}
