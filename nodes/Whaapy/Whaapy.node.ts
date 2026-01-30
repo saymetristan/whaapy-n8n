@@ -233,41 +233,35 @@ export class Whaapy implements INodeType {
         },
       },
 
-      // Message: Send - Template parameters (optional)
+      // Message: Send - Template Additional Options
       {
-        displayName: 'Body Parameters',
-        name: 'templateParameters',
-        type: 'string',
-        default: '',
-        placeholder: 'Juan Pérez, #ORD-12345, $1500',
-        description: 'Optional. Comma-separated values for {{1}}, {{2}}, etc. placeholders. Leave empty if template has no variables.',
-        displayOptions: {
-          show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
-        },
-        routing: {
-          send: { 
-            type: 'body', 
-            property: 'template_parameters',
-            value: '={{ $value ? $value.split(",").map(v => v.trim()) : undefined }}',
-          },
-        },
-      },
-
-      // Message: Send - Template Header Media
-      {
-        displayName: 'Header Media',
-        name: 'templateHeaderMedia',
+        displayName: 'Template Options',
+        name: 'templateOptions',
         type: 'collection',
-        placeholder: 'Add Header Media',
+        placeholder: 'Add Option',
         default: {},
-        description: 'Optional media for template header (image, video, or document)',
         displayOptions: {
           show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
         },
         options: [
           {
-            displayName: 'Media Type',
-            name: 'type',
+            displayName: 'Body Parameters',
+            name: 'parameters',
+            type: 'string',
+            default: '',
+            placeholder: 'Juan Pérez, #ORD-12345, $1500',
+            description: 'Comma-separated values for {{1}}, {{2}}, etc. placeholders in the template body',
+            routing: {
+              send: { 
+                type: 'body', 
+                property: 'template_parameters',
+                value: '={{ $value ? $value.split(",").map(v => v.trim()) : undefined }}',
+              },
+            },
+          },
+          {
+            displayName: 'Header Media Type',
+            name: 'headerMediaType',
             type: 'options',
             default: 'image',
             options: [
@@ -280,12 +274,12 @@ export class Whaapy implements INodeType {
             },
           },
           {
-            displayName: 'Media URL',
-            name: 'url',
+            displayName: 'Header Media URL',
+            name: 'headerMediaUrl',
             type: 'string',
             default: '',
             placeholder: 'https://example.com/image.jpg',
-            description: 'Public URL of the media file',
+            description: 'Public URL of the media file for header',
             routing: {
               send: { type: 'body', property: 'header_media.url' },
             },
