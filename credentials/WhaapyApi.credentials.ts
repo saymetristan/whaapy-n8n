@@ -40,7 +40,7 @@ export class WhaapyApi implements ICredentialType {
   test: ICredentialTestRequest = {
     request: {
       baseURL: '={{$credentials.baseUrl}}',
-      url: '/auth/me',
+      url: '/templates/v1',
     },
   };
 }

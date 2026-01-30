@@ -197,7 +197,8 @@ export class Whaapy implements INodeType {
         type: 'string',
         required: true,
         default: '',
-        description: 'Name of the WhatsApp template to use',
+        placeholder: 'orden_confirmada',
+        description: 'Exact name of the WhatsApp template as it appears in Meta Business Manager',
         displayOptions: {
           show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
         },
@@ -206,19 +207,90 @@ export class Whaapy implements INodeType {
         },
       },
 
+      // Message: Send - Template Language
+      {
+        displayName: 'Language',
+        name: 'templateLanguage',
+        type: 'options',
+        default: 'es_MX',
+        description: 'Template language code',
+        displayOptions: {
+          show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
+        },
+        options: [
+          { name: 'Spanish (Mexico)', value: 'es_MX' },
+          { name: 'Spanish (Spain)', value: 'es_ES' },
+          { name: 'Spanish (Argentina)', value: 'es_AR' },
+          { name: 'English (US)', value: 'en_US' },
+          { name: 'English (UK)', value: 'en_GB' },
+          { name: 'Portuguese (Brazil)', value: 'pt_BR' },
+          { name: 'French', value: 'fr' },
+          { name: 'German', value: 'de' },
+          { name: 'Italian', value: 'it' },
+        ],
+        routing: {
+          send: { type: 'body', property: 'language' },
+        },
+      },
+
       // Message: Send - Template parameters
       {
-        displayName: 'Template Parameters',
+        displayName: 'Body Parameters',
         name: 'templateParameters',
-        type: 'json',
-        default: '[]',
-        description: 'Array of template parameter values',
+        type: 'string',
+        default: '',
+        placeholder: 'Juan Pérez, #ORD-12345, $1500',
+        description: 'Comma-separated values for {{1}}, {{2}}, etc. placeholders in the template body. Example: "Juan, #12345, $100"',
         displayOptions: {
           show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
         },
         routing: {
-          send: { type: 'body', property: 'template_parameters' },
+          send: { 
+            type: 'body', 
+            property: 'template_parameters',
+            value: '={{ $value ? $value.split(",").map(v => v.trim()) : [] }}',
+          },
         },
+      },
+
+      // Message: Send - Template Header Media
+      {
+        displayName: 'Header Media',
+        name: 'templateHeaderMedia',
+        type: 'collection',
+        placeholder: 'Add Header Media',
+        default: {},
+        description: 'Optional media for template header (image, video, or document)',
+        displayOptions: {
+          show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
+        },
+        options: [
+          {
+            displayName: 'Media Type',
+            name: 'type',
+            type: 'options',
+            default: 'image',
+            options: [
+              { name: 'Image', value: 'image' },
+              { name: 'Video', value: 'video' },
+              { name: 'Document', value: 'document' },
+            ],
+            routing: {
+              send: { type: 'body', property: 'header_media.type' },
+            },
+          },
+          {
+            displayName: 'Media URL',
+            name: 'url',
+            type: 'string',
+            default: '',
+            placeholder: 'https://example.com/image.jpg',
+            description: 'Public URL of the media file',
+            routing: {
+              send: { type: 'body', property: 'header_media.url' },
+            },
+          },
+        ],
       },
 
       // Message: Send - Interactive content
@@ -279,12 +351,30 @@ export class Whaapy implements INodeType {
 
       // Message: Send - Contacts
       {
-        displayName: 'Contacts Data',
+        displayName: 'Contacts',
         name: 'contactsData',
         type: 'json',
         required: true,
-        default: '[]',
-        description: 'Array of contact objects',
+        default: `[
+  {
+    "name": {
+      "formatted_name": "Juan Pérez",
+      "first_name": "Juan",
+      "last_name": "Pérez"
+    },
+    "phones": [
+      { "phone": "+5215512345678", "type": "WORK" }
+    ],
+    "emails": [
+      { "email": "juan@empresa.com", "type": "WORK" }
+    ],
+    "org": {
+      "company": "Empresa SA",
+      "title": "Director"
+    }
+  }
+]`,
+        description: 'Array of contact cards to send. Each contact needs: name.formatted_name (required), phones[].phone (required). Optional: emails, org, addresses.',
         displayOptions: {
           show: { resource: ['message'], operation: ['send'], messageType: ['contacts'] },
         },
