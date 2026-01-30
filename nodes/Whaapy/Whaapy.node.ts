@@ -233,14 +233,14 @@ export class Whaapy implements INodeType {
         },
       },
 
-      // Message: Send - Template parameters
+      // Message: Send - Template parameters (optional)
       {
         displayName: 'Body Parameters',
         name: 'templateParameters',
         type: 'string',
         default: '',
         placeholder: 'Juan Pérez, #ORD-12345, $1500',
-        description: 'Comma-separated values for {{1}}, {{2}}, etc. placeholders in the template body. Example: "Juan, #12345, $100"',
+        description: 'Optional. Comma-separated values for {{1}}, {{2}}, etc. placeholders. Leave empty if template has no variables.',
         displayOptions: {
           show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
         },
@@ -248,7 +248,7 @@ export class Whaapy implements INodeType {
           send: { 
             type: 'body', 
             property: 'template_parameters',
-            value: '={{ $value ? $value.split(",").map(v => v.trim()) : [] }}',
+            value: '={{ $value ? $value.split(",").map(v => v.trim()) : undefined }}',
           },
         },
       },
