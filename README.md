@@ -69,7 +69,7 @@ Listen for webhook events:
 - `message.delivered` - Message delivered
 - `message.read` - Message read
 - `message.failed` - Message failed
-- `conversation.created` - New conversation
+- `conversation.created` - New conversation (fires only when a contact writes for the first time, or when you send the first message to a new number via API; use `message.received` for per-message triggers)
 - `conversation.updated` - Conversation updated
 - `conversation.handoff` - Handoff to human
 
