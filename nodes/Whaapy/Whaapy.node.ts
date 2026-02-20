@@ -486,12 +486,48 @@ export class Whaapy implements INodeType {
               { name: 'Document', value: 'document' },
             ]          },
           {
+            displayName: 'Header Media Source',
+            name: 'headerMediaSource',
+            type: 'options',
+            default: 'url',
+            options: [
+              { name: 'URL', value: 'url' },
+              { name: 'Media ID', value: 'media_id' },
+            ],
+            description: 'Choose whether to send a public URL or a previously uploaded Meta Media ID',
+          },
+          {
             displayName: 'Header Media URL',
             name: 'headerMediaUrl',
             type: 'string',
             default: '',
             placeholder: 'https://example.com/image.jpg',
-            description: 'Public URL of the media file for header'          },
+            description: 'Public URL of the media file for header',
+            displayOptions: {
+              show: {
+                resource: ['message'],
+                operation: ['send'],
+                messageType: ['template'],
+                headerMediaSource: ['url'],
+              },
+            },
+          },
+          {
+            displayName: 'Header Media ID',
+            name: 'headerMediaId',
+            type: 'string',
+            default: '',
+            placeholder: '155857201882704',
+            description: 'Meta Media ID previously uploaded in the same WhatsApp account',
+            displayOptions: {
+              show: {
+                resource: ['message'],
+                operation: ['send'],
+                messageType: ['template'],
+                headerMediaSource: ['media_id'],
+              },
+            },
+          },
           {
             displayName: 'Allow Button Payload Override',
             name: 'allowButtonIdOverride',
@@ -1964,11 +2000,41 @@ export class Whaapy implements INodeType {
               if (parsedTemplateParameters.length > 0) {
                 body.template_parameters = parsedTemplateParameters;
               }
-              if (templateOptions.headerMediaType && templateOptions.headerMediaUrl) {
-                body.header_media = {
-                  type: templateOptions.headerMediaType,
-                  url: templateOptions.headerMediaUrl,
-                };
+
+              const hasHeaderMediaUrl = typeof templateOptions.headerMediaUrl === 'string' && templateOptions.headerMediaUrl.trim().length > 0;
+              const hasHeaderMediaId = typeof templateOptions.headerMediaId === 'string' && templateOptions.headerMediaId.trim().length > 0;
+              const headerMediaSource = templateOptions.headerMediaSource || 'url';
+
+              if (hasHeaderMediaUrl && hasHeaderMediaId) {
+                throw new NodeOperationError(
+                  this.getNode(),
+                  'Template header media is ambiguous. Provide either Header Media URL or Header Media ID, not both.'
+                );
+              }
+
+              if (templateOptions.headerMediaType && (hasHeaderMediaUrl || hasHeaderMediaId)) {
+                if (headerMediaSource === 'media_id' && hasHeaderMediaId) {
+                  body.header_media = {
+                    type: templateOptions.headerMediaType,
+                    media_id: templateOptions.headerMediaId.trim(),
+                  };
+                } else if (headerMediaSource === 'url' && hasHeaderMediaUrl) {
+                  body.header_media = {
+                    type: templateOptions.headerMediaType,
+                    url: templateOptions.headerMediaUrl.trim(),
+                  };
+                } else if (hasHeaderMediaId) {
+                  // Compatibility fallback: if source is mismatched but only ID exists, prioritize media_id.
+                  body.header_media = {
+                    type: templateOptions.headerMediaType,
+                    media_id: templateOptions.headerMediaId.trim(),
+                  };
+                } else if (hasHeaderMediaUrl) {
+                  body.header_media = {
+                    type: templateOptions.headerMediaType,
+                    url: templateOptions.headerMediaUrl.trim(),
+                  };
+                }
               }
 
               if (templateOptions.allowButtonIdOverride) {
