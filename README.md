@@ -41,6 +41,9 @@ Follow the [installation guide](https://docs.n8n.io/integrations/community-nodes
 - **Get Variables**: Get available template variables
 - **Sync**: Sync templates from Meta
 
+When sending `template` messages, the `Language` field includes a broad set of Meta-compatible locale codes.  
+If the locale you need is not listed, select **Custom (Enter manually)** and provide the exact code (for example: `en_AU`).
+
 ### Contacts
 - **List**: Get all contacts
 - **Get**: Get a specific contact
