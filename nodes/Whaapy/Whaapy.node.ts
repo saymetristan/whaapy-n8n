@@ -104,6 +104,46 @@ function buildInteractivePayload(params: {
   return interactive;
 }
 
+function parseTemplateParameters(rawParameters: unknown): string[] {
+  if (rawParameters == null) {
+    return [];
+  }
+
+  if (Array.isArray(rawParameters)) {
+    return rawParameters
+      .map((value) => String(value).trim())
+      .filter((value) => value.length > 0);
+  }
+
+  if (typeof rawParameters === 'string') {
+    const trimmedValue = rawParameters.trim();
+    if (!trimmedValue) {
+      return [];
+    }
+
+    // Allow expressions to return JSON arrays: '["Juan","#ORD-123"]'
+    if (trimmedValue.startsWith('[') && trimmedValue.endsWith(']')) {
+      try {
+        const parsedValue = JSON.parse(trimmedValue);
+        if (Array.isArray(parsedValue)) {
+          return parsedValue
+            .map((value) => String(value).trim())
+            .filter((value) => value.length > 0);
+        }
+      } catch {
+        // Fallback to comma-separated parsing below
+      }
+    }
+
+    return trimmedValue
+      .split(',')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+  }
+
+  return [String(rawParameters).trim()].filter((value) => value.length > 0);
+}
+
 export class Whaapy implements INodeType {
   description: INodeTypeDescription = {
     displayName: 'Whaapy',
@@ -1864,8 +1904,9 @@ export class Whaapy implements INodeType {
 
               body.language = templateLanguage;
               const templateOptions = this.getNodeParameter('templateOptions', i, {}) as Record<string, any>;
-              if (templateOptions.parameters) {
-                body.template_parameters = templateOptions.parameters.split(',').map((v: string) => v.trim());
+              const parsedTemplateParameters = parseTemplateParameters(templateOptions.parameters);
+              if (parsedTemplateParameters.length > 0) {
+                body.template_parameters = parsedTemplateParameters;
               }
               if (templateOptions.headerMediaType && templateOptions.headerMediaUrl) {
                 body.header_media = {
