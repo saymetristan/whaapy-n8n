@@ -502,15 +502,7 @@ export class Whaapy implements INodeType {
             type: 'string',
             default: '',
             placeholder: 'https://example.com/image.jpg',
-            description: 'Public URL of the media file for header',
-            displayOptions: {
-              show: {
-                resource: ['message'],
-                operation: ['send'],
-                messageType: ['template'],
-                headerMediaSource: ['url'],
-              },
-            },
+            description: 'Public URL of the media file for header (used when Header Media Source = URL)',
           },
           {
             displayName: 'Header Media ID',
@@ -518,15 +510,7 @@ export class Whaapy implements INodeType {
             type: 'string',
             default: '',
             placeholder: '155857201882704',
-            description: 'Meta Media ID previously uploaded in the same WhatsApp account',
-            displayOptions: {
-              show: {
-                resource: ['message'],
-                operation: ['send'],
-                messageType: ['template'],
-                headerMediaSource: ['media_id'],
-              },
-            },
+            description: 'Meta Media ID previously uploaded in the same WhatsApp account (used when Header Media Source = Media ID)',
           },
           {
             displayName: 'Allow Button Payload Override',
