@@ -2342,16 +2342,39 @@ export class Whaapy implements INodeType {
         // ===========================================
         else if (resource === 'media') {
           if (operation === 'upload') {
-            // Media upload requires special handling with binary data
             const mediaType = this.getNodeParameter('mediaType', i) as string;
             const binaryPropertyName = this.getNodeParameter('binaryPropertyName', i) as string;
-            
-            // For now, just return an error - binary upload needs special handling
-            throw new NodeOperationError(
-              this.getNode(),
-              'Media upload from n8n requires binary data handling. Use the HTTP Request node with binary data or upload via URL.',
-              { itemIndex: i },
-            );
+            const itemBinary = items[i].binary;
+
+            if (!itemBinary || !itemBinary[binaryPropertyName]) {
+              throw new NodeOperationError(
+                this.getNode(),
+                `Binary property "${binaryPropertyName}" not found. Attach a file first (for example with Read Binary File or HTTP Request Download).`,
+                { itemIndex: i },
+              );
+            }
+
+            const fileBuffer = await this.helpers.getBinaryDataBuffer(i, binaryPropertyName);
+            const binaryData = itemBinary[binaryPropertyName];
+            const fileName = binaryData.fileName || `${mediaType}-upload`;
+            const mimeType = binaryData.mimeType || 'application/octet-stream';
+
+            response = await this.helpers.request({
+              method: 'POST',
+              url: `${baseUrl}/media/v1`,
+              headers: { 'Authorization': `Bearer ${apiKey}` },
+              formData: {
+                type: mediaType,
+                file: {
+                  value: fileBuffer,
+                  options: {
+                    filename: fileName,
+                    contentType: mimeType,
+                  },
+                },
+              },
+              json: true,
+            });
           }
         }
 
