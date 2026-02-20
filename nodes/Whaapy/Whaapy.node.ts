@@ -144,6 +144,48 @@ function parseTemplateParameters(rawParameters: unknown): string[] {
   return [String(rawParameters).trim()].filter((value) => value.length > 0);
 }
 
+function parseTemplateQuickReplyOverrides(rawOverrides: unknown): Record<number, string> {
+  if (rawOverrides == null || rawOverrides === '') {
+    return {};
+  }
+
+  let parsed: unknown = rawOverrides;
+  if (typeof rawOverrides === 'string') {
+    const trimmed = rawOverrides.trim();
+    if (!trimmed) return {};
+
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+
+  const result: Record<number, string> = {};
+
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      const indexValue = Number((item as any)?.index);
+      const payloadValue = (item as any)?.payload;
+      if (Number.isInteger(indexValue) && indexValue >= 0 && typeof payloadValue === 'string' && payloadValue.trim()) {
+        result[indexValue] = payloadValue.trim();
+      }
+    }
+    return result;
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    for (const [indexKey, payloadValue] of Object.entries(parsed as Record<string, unknown>)) {
+      const indexValue = Number(indexKey);
+      if (Number.isInteger(indexValue) && indexValue >= 0 && typeof payloadValue === 'string' && payloadValue.trim()) {
+        result[indexValue] = payloadValue.trim();
+      }
+    }
+  }
+
+  return result;
+}
+
 export class Whaapy implements INodeType {
   description: INodeTypeDescription = {
     displayName: 'Whaapy',
@@ -450,6 +492,20 @@ export class Whaapy implements INodeType {
             default: '',
             placeholder: 'https://example.com/image.jpg',
             description: 'Public URL of the media file for header'          },
+          {
+            displayName: 'Allow Button Payload Override',
+            name: 'allowButtonIdOverride',
+            type: 'boolean',
+            default: false,
+            description: 'If enabled, lets this request override quick-reply payload IDs configured in the business template',
+          },
+          {
+            displayName: 'Quick Reply Payload Overrides',
+            name: 'quickReplyPayloadOverrides',
+            type: 'json',
+            default: '{}',
+            description: 'Advanced. JSON map index->payload (e.g. {"0":"confirm_order","1":"talk_to_agent"}) or array [{index,payload}]',
+          },
         ],
       },
 
@@ -1913,6 +1969,23 @@ export class Whaapy implements INodeType {
                   type: templateOptions.headerMediaType,
                   url: templateOptions.headerMediaUrl,
                 };
+              }
+
+              if (templateOptions.allowButtonIdOverride) {
+                body.allowButtonIdOverride = true;
+                const overrides = parseTemplateQuickReplyOverrides(templateOptions.quickReplyPayloadOverrides);
+                const overrideEntries = Object.entries(overrides);
+
+                if (overrideEntries.length > 0) {
+                  body.template = {
+                    components: overrideEntries.map(([index, payload]) => ({
+                      type: 'button',
+                      sub_type: 'quick_reply',
+                      index,
+                      parameters: [{ type: 'payload', payload }],
+                    })),
+                  };
+                }
               }
             } else if (messageType === 'interactive') {
               // Build interactive message from structured fields

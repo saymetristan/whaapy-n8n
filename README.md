@@ -44,6 +44,12 @@ Follow the [installation guide](https://docs.n8n.io/integrations/community-nodes
 When sending `template` messages, the `Language` field includes a broad set of Meta-compatible locale codes.  
 If the locale you need is not listed, select **Custom (Enter manually)** and provide the exact code (for example: `en_AU`).
 
+For advanced template quick-reply tracking, you can optionally enable:
+- **Allow Button Payload Override**: sends `allowButtonIdOverride: true`
+- **Quick Reply Payload Overrides**: JSON map index -> payload (for example `{"0":"confirm_order","1":"talk_to_agent"}`)
+
+By default, Whaapy keeps button payload IDs from the business template configuration.
+
 ### Contacts
 - **List**: Get all contacts
 - **Get**: Get a specific contact
