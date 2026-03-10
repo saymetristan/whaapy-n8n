@@ -186,6 +186,95 @@ function parseTemplateQuickReplyOverrides(rawOverrides: unknown): Record<number,
   return result;
 }
 
+function parseTemplateUrlButtonParameters(
+  rawOverrides: unknown,
+): Array<{ index: string; parameters: Array<{ type: 'text'; text: string }> }> {
+  if (rawOverrides == null || rawOverrides === '') {
+    return [];
+  }
+
+  let parsed: unknown = rawOverrides;
+  if (typeof rawOverrides === 'string') {
+    const trimmed = rawOverrides.trim();
+    if (!trimmed) return [];
+
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return [];
+    }
+  }
+
+  if (!Array.isArray(parsed)) {
+    return [];
+  }
+
+  return parsed
+    .map((item) => {
+      const indexValue = Number((item as any)?.index);
+      const textValue = (item as any)?.text;
+      if (!Number.isInteger(indexValue) || indexValue < 0 || typeof textValue !== 'string' || !textValue.trim()) {
+        return null;
+      }
+
+      return {
+        index: String(indexValue),
+        parameters: [{ type: 'text' as const, text: textValue.trim() }],
+      };
+    })
+    .filter((item): item is { index: string; parameters: Array<{ type: 'text'; text: string }> } => item !== null);
+}
+
+function parseTemplateComponents(rawComponents: unknown): Array<Record<string, any>> {
+  if (rawComponents == null || rawComponents === '') {
+    return [];
+  }
+
+  let parsed: unknown = rawComponents;
+  if (typeof rawComponents === 'string') {
+    const trimmed = rawComponents.trim();
+    if (!trimmed) return [];
+
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return [];
+    }
+  }
+
+  return Array.isArray(parsed)
+    ? parsed.filter((component): component is Record<string, any> => component != null && typeof component === 'object')
+    : [];
+}
+
+function getTemplateComponentKey(component: Record<string, any>): string {
+  if (component.type === 'button') {
+    return `button:${String(component.sub_type || '')}:${String(component.index || '')}`;
+  }
+
+  return String(component.type || '');
+}
+
+function mergeTemplateComponents(
+  baseComponents: Array<Record<string, any>>,
+  overrideComponents: Array<Record<string, any>>,
+): Array<Record<string, any>> {
+  const merged = new Map<string, Record<string, any>>();
+  const orderedKeys: string[] = [];
+
+  for (const component of [...baseComponents, ...overrideComponents]) {
+    const key = getTemplateComponentKey(component);
+    if (!merged.has(key)) {
+      orderedKeys.push(key);
+    }
+    merged.set(key, component);
+  }
+
+  return orderedKeys
+    .map((key) => merged.get(key))
+    .filter((component): component is Record<string, any> => component !== undefined);
+}
+
 export class Whaapy implements INodeType {
   description: INodeTypeDescription = {
     displayName: 'Whaapy',
@@ -525,6 +614,20 @@ export class Whaapy implements INodeType {
             type: 'json',
             default: '{}',
             description: 'Advanced. JSON map index->payload (e.g. {"0":"confirm_order","1":"talk_to_agent"}) or array [{index,payload}]',
+          },
+          {
+            displayName: 'URL Button Parameters',
+            name: 'urlButtonParameters',
+            type: 'json',
+            default: '[]',
+            description: 'JSON array for dynamic URL buttons. Example: [{"index":1,"text":"ENV-789"}]',
+          },
+          {
+            displayName: 'Template Components',
+            name: 'templateComponents',
+            type: 'json',
+            default: '[]',
+            description: 'Advanced. Raw Meta template components array. Merged after body/header fields and can override them.',
           },
         ],
       },
@@ -1984,6 +2087,7 @@ export class Whaapy implements INodeType {
               if (parsedTemplateParameters.length > 0) {
                 body.template_parameters = parsedTemplateParameters;
               }
+              const templateComponentsForOverrides: Array<Record<string, any>> = [];
 
               const hasHeaderMediaUrl = typeof templateOptions.headerMediaUrl === 'string' && templateOptions.headerMediaUrl.trim().length > 0;
               const hasHeaderMediaId = typeof templateOptions.headerMediaId === 'string' && templateOptions.headerMediaId.trim().length > 0;
@@ -2021,21 +2125,76 @@ export class Whaapy implements INodeType {
                 }
               }
 
+              if (body.header_media?.type) {
+                const headerType = body.header_media.type;
+                const headerParameter: Record<string, any> = { type: headerType };
+
+                if (typeof body.header_media.media_id === 'string' && body.header_media.media_id.trim()) {
+                  headerParameter[headerType] = { id: body.header_media.media_id.trim() };
+                } else if (typeof body.header_media.url === 'string' && body.header_media.url.trim()) {
+                  headerParameter[headerType] = { link: body.header_media.url.trim() };
+                }
+
+                if (headerParameter[headerType]) {
+                  templateComponentsForOverrides.push({
+                    type: 'header',
+                    parameters: [headerParameter],
+                  });
+                }
+              }
+
+              if (parsedTemplateParameters.length > 0) {
+                templateComponentsForOverrides.push({
+                  type: 'body',
+                  parameters: parsedTemplateParameters.map((value) => ({
+                    type: 'text',
+                    text: value,
+                  })),
+                });
+              }
+
+              const urlButtonComponents = parseTemplateUrlButtonParameters(templateOptions.urlButtonParameters).map((override) => ({
+                type: 'button',
+                sub_type: 'url',
+                index: override.index,
+                parameters: override.parameters,
+              }));
+
+              const rawTemplateComponents = parseTemplateComponents(templateOptions.templateComponents);
+              let mergedTemplateComponents = mergeTemplateComponents(
+                templateComponentsForOverrides,
+                [...urlButtonComponents, ...rawTemplateComponents],
+              );
+
               if (templateOptions.allowButtonIdOverride) {
                 body.allowButtonIdOverride = true;
                 const overrides = parseTemplateQuickReplyOverrides(templateOptions.quickReplyPayloadOverrides);
                 const overrideEntries = Object.entries(overrides);
 
                 if (overrideEntries.length > 0) {
-                  body.template = {
-                    components: overrideEntries.map(([index, payload]) => ({
-                      type: 'button',
-                      sub_type: 'quick_reply',
-                      index,
-                      parameters: [{ type: 'payload', payload }],
-                    })),
-                  };
+                  const quickReplyComponents = overrideEntries.map(([index, payload]) => ({
+                    type: 'button',
+                    sub_type: 'quick_reply',
+                    index,
+                    parameters: [{ type: 'payload', payload }],
+                  }));
+
+                  mergedTemplateComponents = mergeTemplateComponents(
+                    mergedTemplateComponents,
+                    quickReplyComponents,
+                  );
                 }
+              }
+
+              if (mergedTemplateComponents.length > 0) {
+                body.template = {
+                  name: body.templateName,
+                  language: {
+                    code: body.language,
+                    policy: 'deterministic',
+                  },
+                  components: mergedTemplateComponents,
+                };
               }
             } else if (messageType === 'interactive') {
               // Build interactive message from structured fields
@@ -2356,8 +2515,52 @@ export class Whaapy implements INodeType {
 
             const fileBuffer = await this.helpers.getBinaryDataBuffer(i, binaryPropertyName);
             const binaryData = itemBinary[binaryPropertyName];
-            const fileName = binaryData.fileName || `${mediaType}-upload`;
-            const mimeType = binaryData.mimeType || 'application/octet-stream';
+            const binaryDataRaw = binaryData as Record<string, unknown>;
+            const mimeCandidates = [
+              binaryData.mimeType,
+              binaryDataRaw.mime_type,
+              binaryDataRaw.contentType,
+              binaryDataRaw.content_type,
+            ];
+            const resolvedMimeType = mimeCandidates.find(
+              (value) => typeof value === 'string' && value.trim().length > 0,
+            ) as string | undefined;
+            const normalizedMimeType = resolvedMimeType
+              ? resolvedMimeType.trim().split(';')[0].replace(/[^a-zA-Z0-9.+/-]/g, '')
+              : undefined;
+            const mimeTypeByMediaType: Record<string, string> = {
+              image: 'image/jpeg',
+              video: 'video/mp4',
+              audio: 'audio/mpeg',
+              document: 'application/pdf',
+              sticker: 'image/webp',
+            };
+            const isValidMimeType = (value: string) => /^[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+$/.test(value);
+            const finalMimeType = (normalizedMimeType && isValidMimeType(normalizedMimeType))
+              ? normalizedMimeType
+              : (mimeTypeByMediaType[mediaType] ?? 'application/octet-stream');
+            const extensionByMediaType: Record<string, string> = {
+              image: 'jpg',
+              video: 'mp4',
+              audio: 'mp3',
+              document: 'pdf',
+              sticker: 'webp',
+            };
+            const extensionCandidates = [
+              binaryData.fileExtension,
+              binaryDataRaw.fileExtension,
+              binaryDataRaw.file_extension,
+            ];
+            const resolvedExtension = extensionCandidates.find(
+              (value) => typeof value === 'string' && value.trim().length > 0,
+            ) as string | undefined;
+            const normalizedExtension = resolvedExtension
+              ? resolvedExtension.toLowerCase().replace(/[^a-z0-9]/g, '')
+              : extensionByMediaType[mediaType];
+            const baseFileName = (binaryData.fileName || `${mediaType}-upload`).trim();
+            const fileName = baseFileName.includes('.')
+              ? baseFileName
+              : `${baseFileName}.${normalizedExtension || 'bin'}`;
 
             response = await this.helpers.request({
               method: 'POST',
@@ -2369,7 +2572,8 @@ export class Whaapy implements INodeType {
                   value: fileBuffer,
                   options: {
                     filename: fileName,
-                    contentType: mimeType,
+                    contentType: finalMimeType,
+                    knownLength: fileBuffer.length,
                   },
                 },
               },
