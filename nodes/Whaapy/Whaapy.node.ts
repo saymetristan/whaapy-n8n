@@ -1,10 +1,123 @@
 import {
   IExecuteFunctions,
+  IHttpRequestMethods,
+  IHttpRequestOptions,
   INodeExecutionData,
   INodeType,
   INodeTypeDescription,
   NodeOperationError,
 } from 'n8n-workflow';
+
+// ============================================================================
+// PAGINATION HELPER
+// ----------------------------------------------------------------------------
+// Centraliza el llamado a endpoints `/v1` que devuelven el envelope
+// `{ data: [...], pagination: { next_cursor, has_more, ... } }`.
+//
+// Si `returnAll = true`, usa la opción nativa `pagination` de
+// `httpRequestWithAuthentication`: n8n itera automáticamente leyendo
+// `next_cursor` de la respuesta y reinyectándolo como query param
+// hasta que el servidor devuelva `has_more = false` (o `next_cursor = null`).
+//
+// Si `returnAll = false`, sólo trae una página con el `limit` indicado.
+//
+// Devuelve siempre un array PLANO de items (concatenando páginas), listo
+// para mapearse a `INodeExecutionData[]` (1 item de n8n por elemento).
+// ============================================================================
+async function runListV1Paginated(
+  ctx: IExecuteFunctions,
+  opts: {
+    method?: IHttpRequestMethods;
+    url: string;
+    qs?: Record<string, any>;
+    body?: Record<string, any>;
+    returnAll: boolean;
+    limit: number;
+    /** Index del item de entrada (n8n necesita esto para `requestWithAuthenticationPaginated`). */
+    itemIndex?: number;
+    /** Claves a buscar en la respuesta para extraer los items (en orden de prioridad). */
+    dataKeys?: string[];
+    /** Cap de seguridad de páginas para `returnAll`. Default 200. */
+    maxPages?: number;
+  },
+): Promise<any[]> {
+  const {
+    method = 'GET',
+    url,
+    qs = {},
+    body,
+    returnAll,
+    limit,
+    itemIndex = 0,
+    dataKeys = ['data', 'contacts', 'conversations', 'messages', 'stages', 'templates'],
+    maxPages = 200,
+  } = opts;
+
+  const baseQs: Record<string, any> = { ...qs, limit };
+  const isPostBody = method === 'POST' && body !== undefined;
+
+  // Construimos `IRequestOptions` (legacy shape): `requestWithAuthenticationPaginated`
+  // y `httpRequestWithAuthentication` aceptan ambas el mismo shape básico
+  // (uri/url, qs, body, headers, json, method).
+  const requestOptions: any = {
+    method,
+    uri: url,
+    url,
+    qs: isPostBody ? undefined : baseQs,
+    body: isPostBody ? { ...body, limit } : undefined,
+    json: true,
+  };
+
+  if (!returnAll) {
+    const single = await ctx.helpers.httpRequestWithAuthentication.call(
+      ctx,
+      'whaapyApi',
+      requestOptions as IHttpRequestOptions,
+    );
+    return extractItems(single, dataKeys);
+  }
+
+  // Paginación nativa: n8n itera leyendo `next_cursor` del response y reinyectándolo.
+  // Para POST search, el cursor va en el body. Para GET, en query string.
+  const paginationOptions = {
+    continue: '={{ $response.body?.pagination?.has_more === true || (!!$response.body?.pagination?.next_cursor) }}',
+    request: isPostBody
+      ? {
+          body: {
+            cursor: '={{ $response.body?.pagination?.next_cursor ?? $response.body?.next_cursor }}',
+          },
+        }
+      : {
+          qs: {
+            cursor: '={{ $response.body?.pagination?.next_cursor ?? $response.body?.next_cursor }}',
+          },
+        },
+    requestInterval: 100,
+    maxRequests: maxPages,
+  };
+
+  const pages: any[] = await ctx.helpers.requestWithAuthenticationPaginated.call(
+    ctx,
+    requestOptions,
+    itemIndex,
+    paginationOptions,
+    'whaapyApi',
+  );
+
+  return pages.flatMap((page: any) => extractItems(page, dataKeys));
+}
+
+function extractItems(raw: any, dataKeys: string[]): any[] {
+  if (!raw) return [];
+  // `requestWithAuthenticationPaginated` puede devolver `{ body, headers, statusCode }`.
+  const payload = raw?.body && typeof raw.body === 'object' ? raw.body : raw;
+  for (const key of dataKeys) {
+    const value = payload?.[key];
+    if (Array.isArray(value)) return value;
+  }
+  if (Array.isArray(payload)) return payload;
+  return [];
+}
 
 // Helper function to convert string to slug (for auto-generating IDs)
 function slugify(text: string): string {
@@ -1256,6 +1369,39 @@ export class Whaapy implements INodeType {
           show: { resource: ['conversation'], operation: ['pauseAi'] },
         }      },
 
+      // Conversation: List - Return All toggle (paginación nativa n8n)
+      {
+        displayName: 'Return All',
+        name: 'returnAll',
+        type: 'boolean',
+        default: false,
+        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
+        displayOptions: {
+          show: { resource: ['conversation'], operation: ['list'] },
+        },
+      },
+      {
+        displayName: 'Limit',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 20,
+        description: 'Max results por página (1-100)',
+        displayOptions: {
+          show: { resource: ['conversation'], operation: ['list'], returnAll: [false] },
+        },
+      },
+      {
+        displayName: 'Page Size',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 100,
+        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        displayOptions: {
+          show: { resource: ['conversation'], operation: ['list'], returnAll: [true] },
+        },
+      },
       // Conversation: List - Filters
       {
         displayName: 'Filters',
@@ -1284,43 +1430,40 @@ export class Whaapy implements INodeType {
               { name: 'Archived', value: 'archived' },
             ],
             default: 'all'          },
-          {
-            displayName: 'Limit',
-            name: 'limit',
-            type: 'number',
-            default: 20,
-            description: 'Max results (1-100)'          },
-          {
-            displayName: 'Offset',
-            name: 'offset',
-            type: 'number',
-            default: 0          },
         ],
       },
 
-      // Conversation: Get Messages - Pagination
+      // Conversation: Get Messages - Return All toggle
       {
-        displayName: 'Options',
-        name: 'messagesOptions',
-        type: 'collection',
-        placeholder: 'Add Option',
-        default: {},
+        displayName: 'Return All',
+        name: 'returnAll',
+        type: 'boolean',
+        default: false,
+        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
         displayOptions: {
           show: { resource: ['conversation'], operation: ['getMessages'] },
         },
-        options: [
-          {
-            displayName: 'Limit',
-            name: 'limit',
-            type: 'number',
-            default: 50          },
-          {
-            displayName: 'Cursor',
-            name: 'cursor',
-            type: 'string',
-            default: '',
-            description: 'Pagination cursor'          },
-        ],
+      },
+      {
+        displayName: 'Limit',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 50,
+        displayOptions: {
+          show: { resource: ['conversation'], operation: ['getMessages'], returnAll: [false] },
+        },
+      },
+      {
+        displayName: 'Page Size',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 100,
+        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        displayOptions: {
+          show: { resource: ['conversation'], operation: ['getMessages'], returnAll: [true] },
+        },
       },
 
       // ===========================================
@@ -1438,17 +1581,39 @@ export class Whaapy implements INodeType {
             type: 'string',
             default: '',
             description: 'Filter by template status'          },
-          {
-            displayName: 'Limit',
-            name: 'limit',
-            type: 'number',
-            default: 20          },
-          {
-            displayName: 'Offset',
-            name: 'offset',
-            type: 'number',
-            default: 0          },
         ],
+      },
+      // Template: List - Return All toggle
+      {
+        displayName: 'Return All',
+        name: 'returnAll',
+        type: 'boolean',
+        default: false,
+        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
+        displayOptions: {
+          show: { resource: ['template'], operation: ['list'] },
+        },
+      },
+      {
+        displayName: 'Limit',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 50,
+        displayOptions: {
+          show: { resource: ['template'], operation: ['list'], returnAll: [false] },
+        },
+      },
+      {
+        displayName: 'Page Size',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 100,
+        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        displayOptions: {
+          show: { resource: ['template'], operation: ['list'], returnAll: [true] },
+        },
       },
 
       // ===========================================
@@ -1709,17 +1874,39 @@ export class Whaapy implements INodeType {
             name: 'filters',
             type: 'json',
             default: '{}'          },
-          {
-            displayName: 'Limit',
-            name: 'limit',
-            type: 'number',
-            default: 20          },
-          {
-            displayName: 'Cursor',
-            name: 'cursor',
-            type: 'string',
-            default: ''          },
         ],
+      },
+      // Contact: Search - Return All toggle
+      {
+        displayName: 'Return All',
+        name: 'returnAll',
+        type: 'boolean',
+        default: false,
+        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['search'] },
+        },
+      },
+      {
+        displayName: 'Limit',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 20,
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['search'], returnAll: [false] },
+        },
+      },
+      {
+        displayName: 'Page Size',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 100,
+        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['search'], returnAll: [true] },
+        },
       },
 
       // Contact: Bulk - Fields
@@ -1822,17 +2009,39 @@ export class Whaapy implements INodeType {
               { name: 'Descending', value: 'desc' },
             ],
             default: 'desc'          },
-          {
-            displayName: 'Limit',
-            name: 'limit',
-            type: 'number',
-            default: 20          },
-          {
-            displayName: 'Cursor',
-            name: 'cursor',
-            type: 'string',
-            default: ''          },
         ],
+      },
+      // Contact: List - Return All toggle
+      {
+        displayName: 'Return All',
+        name: 'returnAll',
+        type: 'boolean',
+        default: false,
+        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['list'] },
+        },
+      },
+      {
+        displayName: 'Limit',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 20,
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['list'], returnAll: [false] },
+        },
+      },
+      {
+        displayName: 'Page Size',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 100,
+        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['list'], returnAll: [true] },
+        },
       },
 
       // ===========================================
@@ -2013,26 +2222,25 @@ export class Whaapy implements INodeType {
 
       // Funnel: List Stages - Filters
       {
-        displayName: 'Options',
-        name: 'stageListOptions',
-        type: 'collection',
-        placeholder: 'Add Option',
-        default: {},
+        displayName: 'Return All',
+        name: 'returnAll',
+        type: 'boolean',
+        default: true,
+        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
         displayOptions: {
           show: { resource: ['funnel'], operation: ['listStages'] },
         },
-        options: [
-          {
-            displayName: 'Limit',
-            name: 'limit',
-            type: 'number',
-            default: 20          },
-          {
-            displayName: 'Offset',
-            name: 'offset',
-            type: 'number',
-            default: 0          },
-        ],
+      },
+      {
+        displayName: 'Limit',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1, maxValue: 100 },
+        default: 100,
+        description: 'Max stages por página (1-100)',
+        displayOptions: {
+          show: { resource: ['funnel'], operation: ['listStages'] },
+        },
       },
     ],
   };
@@ -2050,6 +2258,10 @@ export class Whaapy implements INodeType {
         const apiKey = credentials.apiKey as string;
 
         let response: any;
+        // Cuando la operación es list/search/getMessages/listStages, procesamos la
+        // paginación nativa de n8n y empujamos 1 item de salida por elemento
+        // recibido (convención n8n). En ese caso saltamos el push genérico final.
+        let listHandled = false;
 
         // ===========================================
         // MESSAGE RESOURCE
@@ -2170,6 +2382,12 @@ export class Whaapy implements INodeType {
                 body.allowButtonIdOverride = true;
                 const overrides = parseTemplateQuickReplyOverrides(templateOptions.quickReplyPayloadOverrides);
                 const overrideEntries = Object.entries(overrides);
+
+                if (overrideEntries.length > 0) {
+                  body.quickReplyPayloadOverrides = Object.fromEntries(
+                    overrideEntries.map(([index, payload]) => [String(index), String(payload)]),
+                  );
+                }
 
                 if (overrideEntries.length > 0) {
                   const quickReplyComponents = overrideEntries.map(([index, payload]) => ({
@@ -2330,19 +2548,21 @@ export class Whaapy implements INodeType {
         else if (resource === 'conversation') {
           if (operation === 'list') {
             const filters = this.getNodeParameter('conversationFilters', i, {}) as Record<string, any>;
+            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
+            const limit = this.getNodeParameter('limit', i, 20) as number;
             const qs: Record<string, any> = {};
             if (filters.search) qs.search = filters.search;
             if (filters.status && filters.status !== 'all') qs.status = filters.status;
-            if (filters.limit) qs.limit = filters.limit;
-            if (filters.offset) qs.offset = filters.offset;
 
-            response = await this.helpers.request({
-              method: 'GET',
+            const items = await runListV1Paginated(this, {
               url: `${baseUrl}/conversations/v1`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
               qs,
-              json: true,
+              returnAll,
+              limit,
+              itemIndex: i,
             });
+            for (const item of items) returnData.push({ json: item });
+            listHandled = true;
           } else if (operation === 'get') {
             const conversationId = this.getNodeParameter('conversationId', i) as string;
             response = await this.helpers.request({
@@ -2361,18 +2581,17 @@ export class Whaapy implements INodeType {
             });
           } else if (operation === 'getMessages') {
             const conversationId = this.getNodeParameter('conversationId', i) as string;
-            const options = this.getNodeParameter('messagesOptions', i, {}) as Record<string, any>;
-            const qs: Record<string, any> = {};
-            if (options.limit) qs.limit = options.limit;
-            if (options.cursor) qs.cursor = options.cursor;
+            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
+            const limit = this.getNodeParameter('limit', i, 50) as number;
 
-            response = await this.helpers.request({
-              method: 'GET',
+            const items = await runListV1Paginated(this, {
               url: `${baseUrl}/conversations/v1/${conversationId}/messages`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              qs,
-              json: true,
+              returnAll,
+              limit,
+              itemIndex: i,
             });
+            for (const item of items) returnData.push({ json: item });
+            listHandled = true;
           } else if (operation === 'close') {
             const conversationId = this.getNodeParameter('conversationId', i) as string;
             response = await this.helpers.request({
@@ -2459,18 +2678,20 @@ export class Whaapy implements INodeType {
         else if (resource === 'template') {
           if (operation === 'list') {
             const filters = this.getNodeParameter('templateFilters', i, {}) as Record<string, any>;
+            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
+            const limit = this.getNodeParameter('limit', i, 50) as number;
             const qs: Record<string, any> = {};
             if (filters.status) qs.status = filters.status;
-            if (filters.limit) qs.limit = filters.limit;
-            if (filters.offset) qs.offset = filters.offset;
 
-            response = await this.helpers.request({
-              method: 'GET',
+            const items = await runListV1Paginated(this, {
               url: `${baseUrl}/templates/v1`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
               qs,
-              json: true,
+              returnAll,
+              limit,
+              itemIndex: i,
             });
+            for (const item of items) returnData.push({ json: item });
+            listHandled = true;
           } else if (operation === 'get') {
             const templateId = this.getNodeParameter('templateId', i) as string;
             response = await this.helpers.request({
@@ -2588,6 +2809,8 @@ export class Whaapy implements INodeType {
         else if (resource === 'contact') {
           if (operation === 'list') {
             const filters = this.getNodeParameter('contactFilters', i, {}) as Record<string, any>;
+            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
+            const limit = this.getNodeParameter('limit', i, 20) as number;
             const qs: Record<string, any> = {};
             Object.entries(filters).forEach(([key, value]) => {
               if (value !== undefined && value !== '') {
@@ -2595,13 +2818,15 @@ export class Whaapy implements INodeType {
               }
             });
 
-            response = await this.helpers.request({
-              method: 'GET',
+            const items = await runListV1Paginated(this, {
               url: `${baseUrl}/contacts/v1`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
               qs,
-              json: true,
+              returnAll,
+              limit,
+              itemIndex: i,
             });
+            for (const item of items) returnData.push({ json: item });
+            listHandled = true;
           } else if (operation === 'get') {
             const lookupBy = this.getNodeParameter('contactLookupBy', i, 'id') as string;
             let resolvedContactId: string;
@@ -2701,20 +2926,23 @@ export class Whaapy implements INodeType {
           } else if (operation === 'search') {
             const query = this.getNodeParameter('searchQuery', i) as string;
             const options = this.getNodeParameter('searchOptions', i, {}) as Record<string, any>;
+            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
+            const limit = this.getNodeParameter('limit', i, 20) as number;
             const body: Record<string, any> = { query };
             if (options.filters) {
               body.filters = typeof options.filters === 'string' ? JSON.parse(options.filters) : options.filters;
             }
-            if (options.limit) body.limit = options.limit;
-            if (options.cursor) body.cursor = options.cursor;
 
-            response = await this.helpers.request({
+            const items = await runListV1Paginated(this, {
               method: 'POST',
               url: `${baseUrl}/contacts/v1/search`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
               body,
-              json: true,
+              returnAll,
+              limit,
+              itemIndex: i,
             });
+            for (const item of items) returnData.push({ json: item });
+            listHandled = true;
           } else if (operation === 'bulk') {
             const bulkOperation = this.getNodeParameter('bulkOperation', i) as string;
             const contacts = this.getNodeParameter('bulkContacts', i) as string;
@@ -2763,18 +2991,18 @@ export class Whaapy implements INodeType {
         // ===========================================
         else if (resource === 'funnel') {
           if (operation === 'listStages') {
-            const options = this.getNodeParameter('stageListOptions', i, {}) as Record<string, any>;
-            const qs: Record<string, any> = {};
-            if (options.limit) qs.limit = options.limit;
-            if (options.offset) qs.offset = options.offset;
+            const returnAll = this.getNodeParameter('returnAll', i, true) as boolean;
+            const limit = this.getNodeParameter('limit', i, 100) as number;
 
-            response = await this.helpers.request({
-              method: 'GET',
+            const items = await runListV1Paginated(this, {
               url: `${baseUrl}/funnel/v1/stages`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              qs,
-              json: true,
+              returnAll,
+              limit,
+              itemIndex: i,
+              dataKeys: ['data', 'stages'],
             });
+            for (const item of items) returnData.push({ json: item });
+            listHandled = true;
           } else if (operation === 'getStage') {
             const stageId = this.getNodeParameter('stageId', i) as string;
             response = await this.helpers.request({
@@ -2845,7 +3073,7 @@ export class Whaapy implements INodeType {
           }
         }
 
-        if (response) {
+        if (!listHandled && response) {
           returnData.push({ json: response });
         }
 
