@@ -40,7 +40,8 @@ export class WhaapyApi implements ICredentialType {
   test: ICredentialTestRequest = {
     request: {
       baseURL: '={{$credentials.baseUrl}}',
-      url: '/templates/v1',
+      // Requires only a valid key, so keys with a narrow scope set still pass the test.
+      url: '/user-webhooks/events',
     },
   };
 }

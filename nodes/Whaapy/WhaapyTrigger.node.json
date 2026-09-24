@@ -1,6 +1,6 @@
 {
-  "node": "n8n-nodes-base.whaapyTrigger",
-  "nodeVersion": "1.0",
+  "node": "n8n-nodes-whaapy.whaapyTrigger",
+  "nodeVersion": "1.1",
   "codexVersion": "1.0",
   "categories": ["Communication", "Marketing & Content"],
   "resources": {
@@ -11,7 +11,7 @@
     ],
     "primaryDocumentation": [
       {
-        "url": "https://docs.whaapy.com/api-reference/webhooks"
+        "url": "https://docs.whaapy.com/api-reference/webhooks/overview"
       }
     ]
   },

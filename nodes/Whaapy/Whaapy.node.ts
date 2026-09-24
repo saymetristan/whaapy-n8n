@@ -1,405 +1,38 @@
-import {
+import type {
   IExecuteFunctions,
-  IHttpRequestMethods,
-  IHttpRequestOptions,
   INodeExecutionData,
   INodeType,
   INodeTypeDescription,
-  NodeOperationError,
 } from 'n8n-workflow';
 
-// ============================================================================
-// PAGINATION HELPER
-// ----------------------------------------------------------------------------
-// Centraliza el llamado a endpoints `/v1` que devuelven el envelope
-// `{ data: [...], pagination: { next_cursor, has_more, ... } }`.
-//
-// Si `returnAll = true`, usa la opción nativa `pagination` de
-// `httpRequestWithAuthentication`: n8n itera automáticamente leyendo
-// `next_cursor` de la respuesta y reinyectándolo como query param
-// hasta que el servidor devuelva `has_more = false` (o `next_cursor = null`).
-//
-// Si `returnAll = false`, sólo trae una página con el `limit` indicado.
-//
-// Devuelve siempre un array PLANO de items (concatenando páginas), listo
-// para mapearse a `INodeExecutionData[]` (1 item de n8n por elemento).
-// ============================================================================
-async function runListV1Paginated(
-  ctx: IExecuteFunctions,
-  opts: {
-    method?: IHttpRequestMethods;
-    url: string;
-    qs?: Record<string, any>;
-    body?: Record<string, any>;
-    returnAll: boolean;
-    limit: number;
-    /** Index del item de entrada (n8n necesita esto para `requestWithAuthenticationPaginated`). */
-    itemIndex?: number;
-    /** Claves a buscar en la respuesta para extraer los items (en orden de prioridad). */
-    dataKeys?: string[];
-    /** Cap de seguridad de páginas para `returnAll`. Default 200. */
-    maxPages?: number;
-  },
-): Promise<any[]> {
-  const {
-    method = 'GET',
-    url,
-    qs = {},
-    body,
-    returnAll,
-    limit,
-    itemIndex = 0,
-    dataKeys = ['data', 'contacts', 'conversations', 'messages', 'stages', 'templates'],
-    maxPages = 200,
-  } = opts;
-
-  const baseQs: Record<string, any> = { ...qs, limit };
-  const isPostBody = method === 'POST' && body !== undefined;
-
-  // Construimos `IRequestOptions` (legacy shape): `requestWithAuthenticationPaginated`
-  // y `httpRequestWithAuthentication` aceptan ambas el mismo shape básico
-  // (uri/url, qs, body, headers, json, method).
-  const requestOptions: any = {
-    method,
-    uri: url,
-    url,
-    qs: isPostBody ? undefined : baseQs,
-    body: isPostBody ? { ...body, limit } : undefined,
-    json: true,
-  };
-
-  if (!returnAll) {
-    const single = await ctx.helpers.httpRequestWithAuthentication.call(
-      ctx,
-      'whaapyApi',
-      requestOptions as IHttpRequestOptions,
-    );
-    return extractItems(single, dataKeys);
-  }
-
-  // Paginación nativa: n8n itera leyendo `next_cursor` del response y reinyectándolo.
-  // Para POST search, el cursor va en el body. Para GET, en query string.
-  const paginationOptions = {
-    continue: '={{ $response.body?.pagination?.has_more === true || (!!$response.body?.pagination?.next_cursor) }}',
-    request: isPostBody
-      ? {
-          body: {
-            cursor: '={{ $response.body?.pagination?.next_cursor ?? $response.body?.next_cursor }}',
-          },
-        }
-      : {
-          qs: {
-            cursor: '={{ $response.body?.pagination?.next_cursor ?? $response.body?.next_cursor }}',
-          },
-        },
-    requestInterval: 100,
-    maxRequests: maxPages,
-  };
-
-  const pages: any[] = await ctx.helpers.requestWithAuthenticationPaginated.call(
-    ctx,
-    requestOptions,
-    itemIndex,
-    paginationOptions,
-    'whaapyApi',
-  );
-
-  return pages.flatMap((page: any) => extractItems(page, dataKeys));
-}
-
-function extractItems(raw: any, dataKeys: string[]): any[] {
-  if (!raw) return [];
-  // `requestWithAuthenticationPaginated` puede devolver `{ body, headers, statusCode }`.
-  const payload = raw?.body && typeof raw.body === 'object' ? raw.body : raw;
-  for (const key of dataKeys) {
-    const value = payload?.[key];
-    if (Array.isArray(value)) return value;
-  }
-  if (Array.isArray(payload)) return payload;
-  return [];
-}
-
-// Helper function to convert string to slug (for auto-generating IDs)
-function slugify(text: string): string {
-  return text
-    .toString()
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, '_')
-    .replace(/[^\w\-]+/g, '')
-    .replace(/\-\-+/g, '_')
-    .replace(/^-+/, '')
-    .replace(/-+$/, '')
-    .substring(0, 256);
-}
-
-// Build interactive message payload from structured fields
-function buildInteractivePayload(params: {
-  interactiveType: string;
-  bodyText: string;
-  headerType?: string;
-  headerText?: string;
-  headerMediaUrl?: string;
-  footerText?: string;
-  buttons?: Array<{ title: string; id?: string }>;
-  listButtonText?: string;
-  sections?: Array<{
-    title?: string;
-    rows: Array<{ title: string; description?: string; id?: string }>;
-  }>;
-  ctaButtonText?: string;
-  ctaButtonUrl?: string;
-}): object {
-  const interactive: Record<string, any> = {
-    type: params.interactiveType,
-    body: {
-      text: params.bodyText,
-    },
-  };
-
-  // Add header if specified
-  if (params.headerType && params.headerType !== 'none') {
-    if (params.headerType === 'text' && params.headerText) {
-      interactive.header = {
-        type: 'text',
-        text: params.headerText,
-      };
-    } else if (['image', 'video', 'document'].includes(params.headerType) && params.headerMediaUrl) {
-      interactive.header = {
-        type: params.headerType,
-        [params.headerType]: {
-          link: params.headerMediaUrl,
-        },
-      };
-    }
-  }
-
-  // Add footer if specified and not empty
-  if (params.footerText && params.footerText.trim()) {
-    interactive.footer = {
-      text: params.footerText.trim(),
-    };
-  }
-
-  // Build action based on type
-  if (params.interactiveType === 'button' && params.buttons && params.buttons.length > 0) {
-    interactive.action = {
-      buttons: params.buttons.map((btn) => ({
-        type: 'reply',
-        reply: {
-          id: btn.id || slugify(btn.title),
-          title: btn.title.substring(0, 20),
-        },
-      })),
-    };
-  } else if (params.interactiveType === 'list' && params.sections && params.sections.length > 0) {
-    interactive.action = {
-      button: params.listButtonText || 'Ver Opciones',
-      sections: params.sections.map((section) => ({
-        title: section.title || undefined,
-        rows: section.rows.map((row) => ({
-          id: row.id || slugify(row.title),
-          title: row.title.substring(0, 24),
-          description: row.description ? row.description.substring(0, 72) : undefined,
-        })),
-      })),
-    };
-  } else if (params.interactiveType === 'cta_url' && params.ctaButtonText && params.ctaButtonUrl) {
-    interactive.action = {
-      name: 'cta_url',
-      parameters: {
-        display_text: params.ctaButtonText.substring(0, 20),
-        url: params.ctaButtonUrl,
-      },
-    };
-  }
-
-  return interactive;
-}
-
-function parseTemplateParameters(rawParameters: unknown): string[] {
-  if (rawParameters == null) {
-    return [];
-  }
-
-  if (Array.isArray(rawParameters)) {
-    return rawParameters
-      .map((value) => String(value).trim())
-      .filter((value) => value.length > 0);
-  }
-
-  if (typeof rawParameters === 'string') {
-    const trimmedValue = rawParameters.trim();
-    if (!trimmedValue) {
-      return [];
-    }
-
-    // Allow expressions to return JSON arrays: '["Juan","#ORD-123"]'
-    if (trimmedValue.startsWith('[') && trimmedValue.endsWith(']')) {
-      try {
-        const parsedValue = JSON.parse(trimmedValue);
-        if (Array.isArray(parsedValue)) {
-          return parsedValue
-            .map((value) => String(value).trim())
-            .filter((value) => value.length > 0);
-        }
-      } catch {
-        // Fallback to comma-separated parsing below
-      }
-    }
-
-    return trimmedValue
-      .split(',')
-      .map((value) => value.trim())
-      .filter((value) => value.length > 0);
-  }
-
-  return [String(rawParameters).trim()].filter((value) => value.length > 0);
-}
-
-function parseTemplateQuickReplyOverrides(rawOverrides: unknown): Record<number, string> {
-  if (rawOverrides == null || rawOverrides === '') {
-    return {};
-  }
-
-  let parsed: unknown = rawOverrides;
-  if (typeof rawOverrides === 'string') {
-    const trimmed = rawOverrides.trim();
-    if (!trimmed) return {};
-
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      return {};
-    }
-  }
-
-  const result: Record<number, string> = {};
-
-  if (Array.isArray(parsed)) {
-    for (const item of parsed) {
-      const indexValue = Number((item as any)?.index);
-      const payloadValue = (item as any)?.payload;
-      if (Number.isInteger(indexValue) && indexValue >= 0 && typeof payloadValue === 'string' && payloadValue.trim()) {
-        result[indexValue] = payloadValue.trim();
-      }
-    }
-    return result;
-  }
-
-  if (parsed && typeof parsed === 'object') {
-    for (const [indexKey, payloadValue] of Object.entries(parsed as Record<string, unknown>)) {
-      const indexValue = Number(indexKey);
-      if (Number.isInteger(indexValue) && indexValue >= 0 && typeof payloadValue === 'string' && payloadValue.trim()) {
-        result[indexValue] = payloadValue.trim();
-      }
-    }
-  }
-
-  return result;
-}
-
-function parseTemplateUrlButtonParameters(
-  rawOverrides: unknown,
-): Array<{ index: string; parameters: Array<{ type: 'text'; text: string }> }> {
-  if (rawOverrides == null || rawOverrides === '') {
-    return [];
-  }
-
-  let parsed: unknown = rawOverrides;
-  if (typeof rawOverrides === 'string') {
-    const trimmed = rawOverrides.trim();
-    if (!trimmed) return [];
-
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      return [];
-    }
-  }
-
-  if (!Array.isArray(parsed)) {
-    return [];
-  }
-
-  return parsed
-    .map((item) => {
-      const indexValue = Number((item as any)?.index);
-      const textValue = (item as any)?.text;
-      if (!Number.isInteger(indexValue) || indexValue < 0 || typeof textValue !== 'string' || !textValue.trim()) {
-        return null;
-      }
-
-      return {
-        index: String(indexValue),
-        parameters: [{ type: 'text' as const, text: textValue.trim() }],
-      };
-    })
-    .filter((item): item is { index: string; parameters: Array<{ type: 'text'; text: string }> } => item !== null);
-}
-
-function parseTemplateComponents(rawComponents: unknown): Array<Record<string, any>> {
-  if (rawComponents == null || rawComponents === '') {
-    return [];
-  }
-
-  let parsed: unknown = rawComponents;
-  if (typeof rawComponents === 'string') {
-    const trimmed = rawComponents.trim();
-    if (!trimmed) return [];
-
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      return [];
-    }
-  }
-
-  return Array.isArray(parsed)
-    ? parsed.filter((component): component is Record<string, any> => component != null && typeof component === 'object')
-    : [];
-}
-
-function getTemplateComponentKey(component: Record<string, any>): string {
-  if (component.type === 'button') {
-    return `button:${String(component.sub_type || '')}:${String(component.index || '')}`;
-  }
-
-  return String(component.type || '');
-}
-
-function mergeTemplateComponents(
-  baseComponents: Array<Record<string, any>>,
-  overrideComponents: Array<Record<string, any>>,
-): Array<Record<string, any>> {
-  const merged = new Map<string, Record<string, any>>();
-  const orderedKeys: string[] = [];
-
-  for (const component of [...baseComponents, ...overrideComponents]) {
-    const key = getTemplateComponentKey(component);
-    if (!merged.has(key)) {
-      orderedKeys.push(key);
-    }
-    merged.set(key, component);
-  }
-
-  return orderedKeys
-    .map((key) => merged.get(key))
-    .filter((component): component is Record<string, any> => component !== undefined);
-}
+import { executeWhaapyOperation } from './actions/router';
+import { broadcastProperties } from './descriptions/BroadcastDescription';
+import { contactExtraProperties } from './descriptions/ContactExtraDescription';
+import { teamProperties } from './descriptions/TeamDescription';
+import {
+  forVersion,
+  funnelStageLocator,
+  templateIdLocator,
+  templateNameLocator,
+  V1,
+  V1_1,
+} from './descriptions/common';
+import { listSearch, loadOptions, resourceMapping } from './methods';
 
 export class Whaapy implements INodeType {
   description: INodeTypeDescription = {
     displayName: 'Whaapy',
     name: 'whaapy',
     icon: 'file:whaapy.svg',
-    group: ['transform'],
-    version: 1,
+    group: ['output'],
+    version: [1, 1.1],
+    defaultVersion: 1.1,
     subtitle: '={{$parameter["operation"] + ": " + $parameter["resource"]}}',
-    description: 'WhatsApp Business API with AI - Send messages, manage conversations, and automate with AI agents',
+    description: 'WhatsApp Business API with AI - Send messages, manage conversations, contacts, broadcasts and AI agents',
     defaults: {
       name: 'Whaapy',
     },
+    usableAsTool: true,
     inputs: ['main'],
     outputs: ['main'],
     credentials: [
@@ -418,16 +51,21 @@ export class Whaapy implements INodeType {
         type: 'options',
         noDataExpression: true,
         options: [
-          { name: 'Message', value: 'message' },
-          { name: 'Media', value: 'media' },
-          { name: 'Conversation', value: 'conversation' },
           { name: 'Agent', value: 'agent' },
-          { name: 'Template', value: 'template' },
+          { name: 'Broadcast', value: 'broadcast' },
           { name: 'Contact', value: 'contact' },
+          { name: 'Conversation', value: 'conversation' },
           { name: 'Funnel', value: 'funnel' },
+          { name: 'Media', value: 'media' },
+          { name: 'Message', value: 'message' },
+          { name: 'Team', value: 'team' },
+          { name: 'Template', value: 'template' },
         ],
         default: 'message',
       },
+
+      ...broadcastProperties,
+      ...teamProperties,
 
       // ===========================================
       // MESSAGE OPERATIONS
@@ -457,7 +95,21 @@ export class Whaapy implements INodeType {
         default: 'send',
       },
 
-      // Message: Send - To field
+      // Message: Send - Recipient
+      {
+        displayName: 'Send To',
+        name: 'sendTo',
+        type: 'options',
+        noDataExpression: true,
+        default: 'phone',
+        options: [
+          { name: 'Phone Number', value: 'phone' },
+          { name: 'Conversation ID', value: 'conversation' },
+        ],
+        displayOptions: {
+          show: { resource: ['message'], operation: ['send'] },
+        },
+      },
       {
         displayName: 'To',
         name: 'to',
@@ -467,7 +119,18 @@ export class Whaapy implements INodeType {
         placeholder: '+5215512345678',
         description: 'Phone number with country code',
         displayOptions: {
-          show: { resource: ['message'], operation: ['send'] },
+          show: { resource: ['message'], operation: ['send'], sendTo: ['phone'] },
+        },
+      },
+      {
+        displayName: 'Conversation ID',
+        name: 'sendConversationId',
+        type: 'string',
+        required: true,
+        default: '',
+        description: 'Whaapy conversation ID to reply in (e.g. from the Whaapy Trigger: data.conversation_id)',
+        displayOptions: {
+          show: { resource: ['message'], operation: ['send'], sendTo: ['conversation'] },
         },
       },
 
@@ -509,7 +172,25 @@ export class Whaapy implements INodeType {
           show: { resource: ['message'], operation: ['send'], messageType: ['text'] },
         }      },
 
-      // Message: Send - Media URL (for image, video, audio, document, sticker)
+      // Message: Send - Media source (for image, video, audio, document, sticker)
+      {
+        displayName: 'Media Source',
+        name: 'mediaSource',
+        type: 'options',
+        default: 'url',
+        options: [
+          { name: 'URL', value: 'url' },
+          { name: 'Media ID', value: 'media_id' },
+        ],
+        description: 'Send a public URL or a Media ID returned by Media → Upload',
+        displayOptions: {
+          show: {
+            resource: ['message'],
+            operation: ['send'],
+            messageType: ['image', 'video', 'audio', 'document', 'sticker'],
+          },
+        },
+      },
       {
         displayName: 'Media URL',
         name: 'mediaUrl',
@@ -517,13 +198,52 @@ export class Whaapy implements INodeType {
         required: true,
         default: '',
         placeholder: 'https://example.com/image.jpg',
-        description: 'URL of the media file or Media ID from upload',
+        description: 'Public URL of the media file',
         displayOptions: {
           show: {
             resource: ['message'],
             operation: ['send'],
             messageType: ['image', 'video', 'audio', 'document', 'sticker'],
+            mediaSource: ['url'],
           },
+        },
+      },
+      {
+        displayName: 'Media ID',
+        name: 'mediaId',
+        type: 'string',
+        required: true,
+        default: '',
+        placeholder: '155857201882704',
+        description: 'Meta Media ID uploaded to the same WhatsApp number (Media → Upload output). Meta keeps it for 30 days.',
+        displayOptions: {
+          show: {
+            resource: ['message'],
+            operation: ['send'],
+            messageType: ['image', 'video', 'audio', 'document', 'sticker'],
+            mediaSource: ['media_id'],
+          },
+        },
+      },
+      {
+        displayName: 'Filename',
+        name: 'mediaFilename',
+        type: 'string',
+        default: '',
+        placeholder: 'cotizacion.pdf',
+        description: 'Filename shown to the recipient',
+        displayOptions: {
+          show: { resource: ['message'], operation: ['send'], messageType: ['document'] },
+        },
+      },
+      {
+        displayName: 'Send as Voice Note',
+        name: 'voiceNote',
+        type: 'boolean',
+        default: false,
+        description: 'Whether to send the audio as a push-to-talk voice note (OGG/Opus recommended)',
+        displayOptions: {
+          show: { resource: ['message'], operation: ['send'], messageType: ['audio'] },
         },
       },
 
@@ -544,17 +264,25 @@ export class Whaapy implements INodeType {
       },
 
       // Message: Send - Template name
-      {
-        displayName: 'Template Name',
-        name: 'templateName',
-        type: 'string',
-        required: true,
-        default: '',
-        placeholder: 'orden_confirmada',
-        description: 'Exact name of the WhatsApp template as it appears in Meta Business Manager',
-        displayOptions: {
-          show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
-        }      },
+      forVersion(
+        {
+          displayName: 'Template Name',
+          name: 'templateName',
+          type: 'string',
+          required: true,
+          default: '',
+          placeholder: 'orden_confirmada',
+          description: 'Exact name of the WhatsApp template as it appears in Meta Business Manager',
+          displayOptions: {
+            show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
+          },
+        },
+        V1,
+      ),
+      forVersion(
+        templateNameLocator({ resource: ['message'], operation: ['send'], messageType: ['template'] }),
+        V1_1,
+      ),
 
       // Message: Send - Template Language
       {
@@ -638,7 +366,7 @@ export class Whaapy implements INodeType {
           { name: 'Uzbek', value: 'uz' },
           { name: 'Vietnamese', value: 'vi' },
           { name: 'Zulu', value: 'zu' },
-          { name: 'Custom (Enter manually)', value: '__custom__' },
+          { name: 'Custom (Enter Manually)', value: '__custom__' },
         ],
       },
       {
@@ -657,6 +385,33 @@ export class Whaapy implements INodeType {
           },
         },
       },
+
+      forVersion(
+        {
+          displayName: 'Template Variables',
+          name: 'templateVariables',
+          type: 'resourceMapper',
+          noDataExpression: true,
+          default: { mappingMode: 'defineBelow', value: null },
+          typeOptions: {
+            loadOptionsDependsOn: ['templateName.value', 'templateLanguage', 'templateLanguageCustom'],
+            resourceMapper: {
+              resourceMapperMethod: 'getTemplateVariableFields',
+              mode: 'add',
+              fieldWords: { singular: 'variable', plural: 'variables' },
+              addAllFields: true,
+              multiKeyMatch: false,
+              supportAutoMap: false,
+              noFieldsError: 'This template has no body or URL button variables',
+            },
+          },
+          description: 'Values for the {{n}} placeholders of the selected template. Leave empty to use Template Options → Body Parameters instead.',
+          displayOptions: {
+            show: { resource: ['message'], operation: ['send'], messageType: ['template'] },
+          },
+        },
+        V1_1,
+      ),
 
       // Message: Send - Template Additional Options
       {
@@ -820,21 +575,56 @@ export class Whaapy implements INodeType {
         },
       },
 
-      // Interactive: Header media URL (if type=image|video|document)
-          {
-            displayName: 'Header Media URL',
-        name: 'interactiveHeaderMediaUrl',
-            type: 'string',
-            default: '',
-            placeholder: 'https://example.com/image.jpg',
-            description: 'Public URL of the media file for header',
+      // Interactive: Header media (if type=image|video|document)
+      {
+        displayName: 'Header Media Source',
+        name: 'interactiveHeaderMediaSource',
+        type: 'options',
+        default: 'url',
+        options: [
+          { name: 'URL', value: 'url' },
+          { name: 'Media ID', value: 'media_id' },
+        ],
         displayOptions: {
-          show: { 
-            resource: ['message'], 
-            operation: ['send'], 
+          show: {
+            resource: ['message'],
+            operation: ['send'],
             messageType: ['interactive'],
             interactiveHeaderType: ['image', 'video', 'document'],
-            
+          },
+        },
+      },
+      {
+        displayName: 'Header Media URL',
+        name: 'interactiveHeaderMediaUrl',
+        type: 'string',
+        default: '',
+        placeholder: 'https://example.com/image.jpg',
+        description: 'Public URL of the media file for header',
+        displayOptions: {
+          show: {
+            resource: ['message'],
+            operation: ['send'],
+            messageType: ['interactive'],
+            interactiveHeaderType: ['image', 'video', 'document'],
+            interactiveHeaderMediaSource: ['url'],
+          },
+        },
+      },
+      {
+        displayName: 'Header Media ID',
+        name: 'interactiveHeaderMediaId',
+        type: 'string',
+        default: '',
+        placeholder: '155857201882704',
+        description: 'Media ID returned by Media → Upload',
+        displayOptions: {
+          show: {
+            resource: ['message'],
+            operation: ['send'],
+            messageType: ['interactive'],
+            interactiveHeaderType: ['image', 'video', 'document'],
+            interactiveHeaderMediaSource: ['media_id'],
           },
         },
       },
@@ -1175,6 +965,13 @@ export class Whaapy implements INodeType {
             type: 'json',
             default: '{}',
             description: 'Custom metadata to attach to the message'          },
+          {
+            displayName: 'Link Preview',
+            name: 'previewUrl',
+            type: 'boolean',
+            default: false,
+            description: 'Whether WhatsApp should render a preview for the first URL in a text message',
+          },
         ],
       },
 
@@ -1297,9 +1094,15 @@ export class Whaapy implements INodeType {
             description: 'Mark a conversation as read',
           },
           {
+            name: 'Mark Unread',
+            value: 'markUnread',
+            action: 'Mark conversation as unread',
+            description: 'Mark a conversation as unread so it shows up in the inbox again',
+          },
+          {
             name: 'Set AI',
             value: 'setAi',
-            action: 'Enable/disable AI',
+            action: 'Enable disable ai',
             description: 'Enable or disable AI for a conversation',
           },
           {
@@ -1328,7 +1131,7 @@ export class Whaapy implements INodeType {
         displayOptions: {
           show: {
             resource: ['conversation'],
-            operation: ['get', 'getMessages', 'close', 'archive', 'markRead', 'setAi', 'pauseAi', 'aiSuggest'],
+            operation: ['get', 'getMessages', 'close', 'archive', 'markRead', 'markUnread', 'setAi', 'pauseAi', 'aiSuggest'],
           },
         },
       },
@@ -1375,7 +1178,7 @@ export class Whaapy implements INodeType {
         name: 'returnAll',
         type: 'boolean',
         default: false,
-        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
+        description: 'Whether to return all results or only up to a given limit',
         displayOptions: {
           show: { resource: ['conversation'], operation: ['list'] },
         },
@@ -1386,7 +1189,7 @@ export class Whaapy implements INodeType {
         type: 'number',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 20,
-        description: 'Max results por página (1-100)',
+        description: 'Max number of results to return',
         displayOptions: {
           show: { resource: ['conversation'], operation: ['list'], returnAll: [false] },
         },
@@ -1397,7 +1200,7 @@ export class Whaapy implements INodeType {
         type: 'number',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 100,
-        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        description: 'Max number of results to return',
         displayOptions: {
           show: { resource: ['conversation'], operation: ['list'], returnAll: [true] },
         },
@@ -1439,7 +1242,7 @@ export class Whaapy implements INodeType {
         name: 'returnAll',
         type: 'boolean',
         default: false,
-        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
+        description: 'Whether to return all results or only up to a given limit',
         displayOptions: {
           show: { resource: ['conversation'], operation: ['getMessages'] },
         },
@@ -1448,6 +1251,7 @@ export class Whaapy implements INodeType {
         displayName: 'Limit',
         name: 'limit',
         type: 'number',
+        description: 'Max number of results to return',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 50,
         displayOptions: {
@@ -1460,7 +1264,7 @@ export class Whaapy implements INodeType {
         type: 'number',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 100,
-        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        description: 'Max number of results to return',
         displayOptions: {
           show: { resource: ['conversation'], operation: ['getMessages'], returnAll: [true] },
         },
@@ -1553,16 +1357,20 @@ export class Whaapy implements INodeType {
       },
 
       // Template: Get - ID
-      {
-        displayName: 'Template ID',
-        name: 'templateId',
-        type: 'string',
-        required: true,
-        default: '',
-        displayOptions: {
-          show: { resource: ['template'], operation: ['get'] },
+      forVersion(
+        {
+          displayName: 'Template ID',
+          name: 'templateId',
+          type: 'string',
+          required: true,
+          default: '',
+          displayOptions: {
+            show: { resource: ['template'], operation: ['get'] },
+          },
         },
-      },
+        V1,
+      ),
+      forVersion(templateIdLocator('templateId', { resource: ['template'], operation: ['get'] }), V1_1),
 
       // Template: List - Filters
       {
@@ -1589,7 +1397,7 @@ export class Whaapy implements INodeType {
         name: 'returnAll',
         type: 'boolean',
         default: false,
-        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
+        description: 'Whether to return all results or only up to a given limit',
         displayOptions: {
           show: { resource: ['template'], operation: ['list'] },
         },
@@ -1598,6 +1406,7 @@ export class Whaapy implements INodeType {
         displayName: 'Limit',
         name: 'limit',
         type: 'number',
+        description: 'Max number of results to return',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 50,
         displayOptions: {
@@ -1610,7 +1419,7 @@ export class Whaapy implements INodeType {
         type: 'number',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 100,
-        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        description: 'Max number of results to return',
         displayOptions: {
           show: { resource: ['template'], operation: ['list'], returnAll: [true] },
         },
@@ -1644,6 +1453,24 @@ export class Whaapy implements INodeType {
             value: 'create',
             action: 'Create a contact',
             description: 'Create a new contact'          },
+          {
+            name: 'Create or Update',
+            value: 'upsert',
+            action: 'Create or update a contact',
+            description: 'Create a new record, or update the current one if it already exists (upsert)',
+          },
+          {
+            name: 'Create Lead',
+            value: 'createLead',
+            action: 'Create an inbound lead',
+            description: 'Create or update a lead and optionally send it a template in one call',
+          },
+          {
+            name: 'Add Note',
+            value: 'addNote',
+            action: 'Add a note to a contact',
+            description: 'Add an internal note to the contact timeline',
+          },
           {
             name: 'Update',
             value: 'update',
@@ -1712,7 +1539,7 @@ export class Whaapy implements INodeType {
         displayOptions: {
           show: {
             resource: ['contact'],
-            operation: ['update', 'delete', 'merge'],
+            operation: ['update', 'delete', 'merge', 'addNote'],
           },
         },
       },
@@ -1754,10 +1581,9 @@ export class Whaapy implements INodeType {
         displayName: 'Name',
         name: 'contactName',
         type: 'string',
-        required: true,
         default: '',
         displayOptions: {
-          show: { resource: ['contact'], operation: ['create'] },
+          show: { resource: ['contact'], operation: ['create', 'upsert'] },
         }      },
       {
         displayName: 'Phone Number',
@@ -1767,7 +1593,7 @@ export class Whaapy implements INodeType {
         default: '',
         placeholder: '+5215512345678',
         displayOptions: {
-          show: { resource: ['contact'], operation: ['create'] },
+          show: { resource: ['contact'], operation: ['create', 'upsert'] },
         }      },
       {
         displayName: 'Additional Fields',
@@ -1776,30 +1602,68 @@ export class Whaapy implements INodeType {
         placeholder: 'Add Field',
         default: {},
         displayOptions: {
-          show: { resource: ['contact'], operation: ['create'] },
+          show: { resource: ['contact'], operation: ['create', 'upsert'] },
         },
         options: [
           {
-            displayName: 'Email',
-            name: 'email',
-            type: 'string',
-            default: ''          },
+            displayName: 'Assigned Agent Name or ID',
+            name: 'assignedAgentId',
+            type: 'options',
+            typeOptions: { loadOptionsMethod: 'getTeamMembers' },
+            default: '',
+            description: 'Human agent responsible for this contact. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
+          },
           {
-            displayName: 'Tags',
-            name: 'tags',
+            displayName: 'Company',
+            name: 'company',
             type: 'string',
             default: '',
-            description: 'Comma-separated list of tags'          },
+          },
           {
             displayName: 'Custom Fields',
             name: 'customFields',
             type: 'json',
             default: '{}'          },
           {
-            displayName: 'Metadata',
-            name: 'metadata',
-            type: 'json',
-            default: '{}'          },
+            displayName: 'Deal Value',
+            name: 'dealValue',
+            type: 'number',
+            default: 0,
+          },
+          {
+            displayName: 'Email',
+            name: 'email',
+            type: 'string',
+            placeholder: 'name@email.com',
+            default: ''          },
+          {
+            displayName: 'Funnel Stage Name or ID',
+            name: 'funnelStageId',
+            type: 'options',
+            typeOptions: { loadOptionsMethod: 'getFunnelStages' },
+            default: '',
+            description: 'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
+          },
+          {
+            displayName: 'Notes',
+            name: 'notes',
+            type: 'string',
+            typeOptions: { rows: 3 },
+            default: '',
+          },
+          {
+            displayName: 'Source',
+            name: 'source',
+            type: 'string',
+            default: 'n8n',
+            description: 'Where the contact came from (max 50 characters)',
+          },
+          {
+            displayName: 'Tags',
+            name: 'tags',
+            type: 'string',
+            default: '',
+            description: 'Comma-separated list of tags'          },
         ],
       },
 
@@ -1820,21 +1684,56 @@ export class Whaapy implements INodeType {
             type: 'string',
             default: ''          },
           {
-            displayName: 'Phone Number',
-            name: 'phoneNumber',
-            type: 'string',
-            default: ''          },
-          {
             displayName: 'Email',
             name: 'email',
             type: 'string',
+            placeholder: 'name@email.com',
             default: ''          },
           {
-            displayName: 'Tags',
+            displayName: 'Assigned Agent ID',
+            name: 'assignedAgentId',
+            type: 'string',
+            default: '',
+            description: 'Team member ID (see Team → List). Use "none" to unassign.',
+          },
+          {
+            displayName: 'Company',
+            name: 'company',
+            type: 'string',
+            default: '',
+          },
+          {
+            displayName: 'Deal Value',
+            name: 'dealValue',
+            type: 'number',
+            default: 0,
+          },
+          {
+            displayName: 'Notes',
+            name: 'notes',
+            type: 'string',
+            typeOptions: { rows: 3 },
+            default: '',
+            description: 'Appended as a new note on the contact',
+          },
+          {
+            displayName: 'Add Tags',
+            name: 'addTags',
+            type: 'string',
+            default: '',
+            description: 'Comma-separated tags to add without removing existing tags'          },
+          {
+            displayName: 'Remove Tags',
+            name: 'removeTags',
+            type: 'string',
+            default: '',
+            description: 'Comma-separated tags to remove from the contact'          },
+          {
+            displayName: 'Replace Tags',
             name: 'tags',
             type: 'string',
             default: '',
-            description: 'Comma-separated list of tags'          },
+            description: 'Comma-separated tags that replace all existing tags'          },
           {
             displayName: 'Funnel Stage ID',
             name: 'funnelStageId',
@@ -1854,8 +1753,8 @@ export class Whaapy implements INodeType {
         displayName: 'Search Query',
         name: 'searchQuery',
         type: 'string',
-        required: true,
         default: '',
+        description: 'Text matched against name, phone, email and company. Leave empty to only use filters.',
         displayOptions: {
           show: { resource: ['contact'], operation: ['search'] },
         }      },
@@ -1882,7 +1781,7 @@ export class Whaapy implements INodeType {
         name: 'returnAll',
         type: 'boolean',
         default: false,
-        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
+        description: 'Whether to return all results or only up to a given limit',
         displayOptions: {
           show: { resource: ['contact'], operation: ['search'] },
         },
@@ -1891,6 +1790,7 @@ export class Whaapy implements INodeType {
         displayName: 'Limit',
         name: 'limit',
         type: 'number',
+        description: 'Max number of results to return',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 20,
         displayOptions: {
@@ -1903,7 +1803,7 @@ export class Whaapy implements INodeType {
         type: 'number',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 100,
-        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        description: 'Max number of results to return',
         displayOptions: {
           show: { resource: ['contact'], operation: ['search'], returnAll: [true] },
         },
@@ -1919,8 +1819,9 @@ export class Whaapy implements INodeType {
           { name: 'Create', value: 'create' },
           { name: 'Update', value: 'update' },
           { name: 'Delete', value: 'delete' },
-          { name: 'Tag', value: 'tag' },
-          { name: 'Untag', value: 'untag' },
+          { name: 'Add Tags', value: 'tag' },
+          { name: 'Remove Tags', value: 'untag' },
+          { name: 'Set Funnel Stage', value: 'set_funnel_stage' },
         ],
         default: 'create',
         displayOptions: {
@@ -1932,18 +1833,58 @@ export class Whaapy implements INodeType {
         type: 'json',
         required: true,
         default: '[]',
-        description: 'Array of contacts or contact IDs',
+        description: 'Array (max 100) of contacts in API format. Create: [{"phone_number":"+52...","name":"..."}]. Update: [{"ID":"uuid","name":"..."}].',
         displayOptions: {
-          show: { resource: ['contact'], operation: ['bulk'] },
+          show: { resource: ['contact'], operation: ['bulk'], bulkOperation: ['create', 'update'], '@version': [1.1] },
+        }      },
+      {
+        displayName: 'Contacts Data',
+        name: 'bulkContacts',
+        type: 'json',
+        default: '[]',
+        description: 'Create/Update: array of contacts in API format. Other operations: array of contact IDs (or use Contact IDs).',
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['bulk'], '@version': [1] },
+        }      },
+      {
+        displayName: 'Contact IDs',
+        name: 'bulkContactIds',
+        type: 'string',
+        default: '',
+        placeholder: 'uuid-1, uuid-2',
+        description: 'Up to 100 contact IDs, comma-separated or as an array expression',
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['bulk'], bulkOperation: ['delete', 'tag', 'untag', 'set_funnel_stage'] },
+        }      },
+      {
+        displayName: 'Tags',
+        name: 'bulkTags',
+        type: 'string',
+        default: '',
+        placeholder: 'vip, black-friday',
+        description: 'Comma-separated tags (max 20)',
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['bulk'], bulkOperation: ['tag', 'untag'] },
+        }      },
+      {
+        displayName: 'Funnel Stage Name or ID',
+        name: 'bulkFunnelStageId',
+        type: 'options',
+        typeOptions: { loadOptionsMethod: 'getFunnelStages' },
+        required: true,
+        default: '',
+        description: 'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
+        displayOptions: {
+          show: { resource: ['contact'], operation: ['bulk'], bulkOperation: ['set_funnel_stage'] },
         }      },
       {
         displayName: 'Operation Data',
         name: 'bulkData',
         type: 'json',
         default: '{}',
-        description: 'Additional data for the operation',
+        description: 'Legacy field. Only read when Contact IDs or Tags are empty (keys: "contact_ids", "tags").',
         displayOptions: {
-          show: { resource: ['contact'], operation: ['bulk'] },
+          show: { resource: ['contact'], operation: ['bulk'], '@version': [1], bulkOperation: ['delete', 'tag', 'untag'] },
         }      },
 
       // Contact: Merge - Merge With ID
@@ -1953,7 +1894,7 @@ export class Whaapy implements INodeType {
         type: 'string',
         required: true,
         default: '',
-        description: 'ID of the contact to merge into the primary contact',
+        description: 'ID of the duplicate contact. It is merged into Contact ID and then removed.',
         displayOptions: {
           show: { resource: ['contact'], operation: ['merge'] },
         }      },
@@ -2017,7 +1958,7 @@ export class Whaapy implements INodeType {
         name: 'returnAll',
         type: 'boolean',
         default: false,
-        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
+        description: 'Whether to return all results or only up to a given limit',
         displayOptions: {
           show: { resource: ['contact'], operation: ['list'] },
         },
@@ -2026,6 +1967,7 @@ export class Whaapy implements INodeType {
         displayName: 'Limit',
         name: 'limit',
         type: 'number',
+        description: 'Max number of results to return',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 20,
         displayOptions: {
@@ -2038,7 +1980,7 @@ export class Whaapy implements INodeType {
         type: 'number',
         typeOptions: { minValue: 1, maxValue: 100 },
         default: 100,
-        description: 'Tamaño de página interno cuando Return All está activo (1-100)',
+        description: 'Max number of results to return',
         displayOptions: {
           show: { resource: ['contact'], operation: ['list'], returnAll: [true] },
         },
@@ -2100,19 +2042,26 @@ export class Whaapy implements INodeType {
       },
 
       // Funnel: Stage ID
-      {
-        displayName: 'Stage ID',
-        name: 'stageId',
-        type: 'string',
-        required: true,
-        default: '',
-        displayOptions: {
-          show: {
-            resource: ['funnel'],
-            operation: ['getStage', 'updateStage', 'deleteStage'],
+      forVersion(
+        {
+          displayName: 'Stage ID',
+          name: 'stageId',
+          type: 'string',
+          required: true,
+          default: '',
+          displayOptions: {
+            show: {
+              resource: ['funnel'],
+              operation: ['getStage', 'updateStage', 'deleteStage'],
+            },
           },
         },
-      },
+        V1,
+      ),
+      forVersion(
+        funnelStageLocator('stageId', 'Stage', { resource: ['funnel'], operation: ['getStage', 'updateStage', 'deleteStage'] }),
+        V1_1,
+      ),
 
       // Funnel: Create Stage - Fields
       {
@@ -2138,18 +2087,16 @@ export class Whaapy implements INodeType {
             displayName: 'Position',
             name: 'position',
             type: 'number',
-            default: 0          },
+            typeOptions: { minValue: 0 },
+            default: 0,
+            description: 'Zero-based position. Defaults to the end of the funnel.',
+          },
           {
             displayName: 'Color',
             name: 'color',
-            type: 'string',
+            type: 'color',
             default: '#3B82F6',
             description: 'Hex color code'          },
-          {
-            displayName: 'Description',
-            name: 'description',
-            type: 'string',
-            default: ''          },
         ],
       },
 
@@ -2170,20 +2117,11 @@ export class Whaapy implements INodeType {
             type: 'string',
             default: ''          },
           {
-            displayName: 'Position',
-            name: 'position',
-            type: 'number',
-            default: 0          },
-          {
             displayName: 'Color',
             name: 'color',
-            type: 'string',
-            default: ''          },
-          {
-            displayName: 'Description',
-            name: 'description',
-            type: 'string',
-            default: ''          },
+            type: 'color',
+            default: '#3B82F6',
+          },
         ],
       },
 
@@ -2194,7 +2132,7 @@ export class Whaapy implements INodeType {
         type: 'json',
         required: true,
         default: '[]',
-        description: 'Array of objects with id and position',
+        description: 'Stage IDs in the new order: ["uuid-1","uuid-2"] or comma-separated. Legacy [{"ID","position"}] arrays are sorted by position.',
         displayOptions: {
           show: { resource: ['funnel'], operation: ['reorderStages'] },
         }      },
@@ -2210,882 +2148,60 @@ export class Whaapy implements INodeType {
           show: { resource: ['funnel'], operation: ['moveContact'] },
         },
       },
-      {
-        displayName: 'Target Stage ID',
-        name: 'targetStageId',
-        type: 'string',
-        required: true,
-        default: '',
-        displayOptions: {
-          show: { resource: ['funnel'], operation: ['moveContact'] },
-        }      },
+      forVersion(
+        {
+          displayName: 'Target Stage ID',
+          name: 'targetStageId',
+          type: 'string',
+          required: true,
+          default: '',
+          displayOptions: {
+            show: { resource: ['funnel'], operation: ['moveContact'] },
+          },
+        },
+        V1,
+      ),
+      forVersion(
+        funnelStageLocator('targetStageId', 'Target Stage', { resource: ['funnel'], operation: ['moveContact'] }),
+        V1_1,
+      ),
 
-      // Funnel: List Stages - Filters
-      {
-        displayName: 'Return All',
-        name: 'returnAll',
-        type: 'boolean',
-        default: true,
-        description: 'Itera automáticamente todas las páginas vía next_cursor (paginación nativa)',
-        displayOptions: {
-          show: { resource: ['funnel'], operation: ['listStages'] },
+      // Funnel: List Stages (v1 kept its pagination toggle; the endpoint always returns every stage)
+      forVersion(
+        {
+          displayName: 'Return All',
+          name: 'returnAll',
+          type: 'boolean',
+          default: true,
+          description: 'Whether to return all results or only up to a given limit',
+          displayOptions: {
+            show: { resource: ['funnel'], operation: ['listStages'] },
+          },
         },
-      },
-      {
-        displayName: 'Limit',
-        name: 'limit',
-        type: 'number',
-        typeOptions: { minValue: 1, maxValue: 100 },
-        default: 100,
-        description: 'Max stages por página (1-100)',
-        displayOptions: {
-          show: { resource: ['funnel'], operation: ['listStages'] },
+        V1,
+      ),
+      forVersion(
+        {
+          displayName: 'Limit',
+          name: 'limit',
+          type: 'number',
+          typeOptions: { minValue: 1, maxValue: 100 },
+          default: 100,
+          description: 'Max number of results to return',
+          displayOptions: {
+            show: { resource: ['funnel'], operation: ['listStages'] },
+          },
         },
-      },
+        V1,
+      ),
+
+      ...contactExtraProperties,
     ],
   };
 
+  methods = { listSearch, loadOptions, resourceMapping };
+
   async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-    const items = this.getInputData();
-    const returnData: INodeExecutionData[] = [];
-
-    for (let i = 0; i < items.length; i++) {
-      try {
-        const resource = this.getNodeParameter('resource', i) as string;
-        const operation = this.getNodeParameter('operation', i) as string;
-        const credentials = await this.getCredentials('whaapyApi');
-        const baseUrl = credentials.baseUrl as string;
-        const apiKey = credentials.apiKey as string;
-
-        let response: any;
-        // Cuando la operación es list/search/getMessages/listStages, procesamos la
-        // paginación nativa de n8n y empujamos 1 item de salida por elemento
-        // recibido (convención n8n). En ese caso saltamos el push genérico final.
-        let listHandled = false;
-
-        // ===========================================
-        // MESSAGE RESOURCE
-        // ===========================================
-        if (resource === 'message') {
-          if (operation === 'send') {
-            const to = this.getNodeParameter('to', i) as string;
-            const messageType = this.getNodeParameter('messageType', i) as string;
-            const body: Record<string, any> = { to, type: messageType };
-
-            // Handle different message types
-            if (messageType === 'text') {
-              body.content = this.getNodeParameter('textContent', i) as string;
-            } else if (['image', 'video', 'audio', 'document', 'sticker'].includes(messageType)) {
-              const mediaUrl = this.getNodeParameter('mediaUrl', i) as string;
-              body[messageType] = { link: mediaUrl };
-              if (['image', 'video', 'document'].includes(messageType)) {
-                const caption = this.getNodeParameter('caption', i, '') as string;
-                if (caption) body[messageType].caption = caption;
-              }
-            } else if (messageType === 'template') {
-              body.templateName = this.getNodeParameter('templateName', i) as string;
-              const selectedTemplateLanguage = this.getNodeParameter('templateLanguage', i) as string;
-              const templateLanguage = selectedTemplateLanguage === '__custom__'
-                ? (this.getNodeParameter('templateLanguageCustom', i, '') as string).trim()
-                : selectedTemplateLanguage;
-
-              if (!templateLanguage) {
-                throw new NodeOperationError(this.getNode(), 'Template language is required. Select a language or enter a custom language code.');
-              }
-
-              body.language = templateLanguage;
-              const templateOptions = this.getNodeParameter('templateOptions', i, {}) as Record<string, any>;
-              const parsedTemplateParameters = parseTemplateParameters(templateOptions.parameters);
-              if (parsedTemplateParameters.length > 0) {
-                body.template_parameters = parsedTemplateParameters;
-              }
-              const templateComponentsForOverrides: Array<Record<string, any>> = [];
-
-              const hasHeaderMediaUrl = typeof templateOptions.headerMediaUrl === 'string' && templateOptions.headerMediaUrl.trim().length > 0;
-              const hasHeaderMediaId = typeof templateOptions.headerMediaId === 'string' && templateOptions.headerMediaId.trim().length > 0;
-              const headerMediaSource = templateOptions.headerMediaSource || 'url';
-
-              if (hasHeaderMediaUrl && hasHeaderMediaId) {
-                throw new NodeOperationError(
-                  this.getNode(),
-                  'Template header media is ambiguous. Provide either Header Media URL or Header Media ID, not both.'
-                );
-              }
-
-              if (templateOptions.headerMediaType && (hasHeaderMediaUrl || hasHeaderMediaId)) {
-                if (headerMediaSource === 'media_id' && hasHeaderMediaId) {
-                  body.header_media = {
-                    type: templateOptions.headerMediaType,
-                    media_id: templateOptions.headerMediaId.trim(),
-                  };
-                } else if (headerMediaSource === 'url' && hasHeaderMediaUrl) {
-                  body.header_media = {
-                    type: templateOptions.headerMediaType,
-                    url: templateOptions.headerMediaUrl.trim(),
-                  };
-                } else if (hasHeaderMediaId) {
-                  // Compatibility fallback: if source is mismatched but only ID exists, prioritize media_id.
-                  body.header_media = {
-                    type: templateOptions.headerMediaType,
-                    media_id: templateOptions.headerMediaId.trim(),
-                  };
-                } else if (hasHeaderMediaUrl) {
-                  body.header_media = {
-                    type: templateOptions.headerMediaType,
-                    url: templateOptions.headerMediaUrl.trim(),
-                  };
-                }
-              }
-
-              if (body.header_media?.type) {
-                const headerType = body.header_media.type;
-                const headerParameter: Record<string, any> = { type: headerType };
-
-                if (typeof body.header_media.media_id === 'string' && body.header_media.media_id.trim()) {
-                  headerParameter[headerType] = { id: body.header_media.media_id.trim() };
-                } else if (typeof body.header_media.url === 'string' && body.header_media.url.trim()) {
-                  headerParameter[headerType] = { link: body.header_media.url.trim() };
-                }
-
-                if (headerParameter[headerType]) {
-                  templateComponentsForOverrides.push({
-                    type: 'header',
-                    parameters: [headerParameter],
-                  });
-                }
-              }
-
-              if (parsedTemplateParameters.length > 0) {
-                templateComponentsForOverrides.push({
-                  type: 'body',
-                  parameters: parsedTemplateParameters.map((value) => ({
-                    type: 'text',
-                    text: value,
-                  })),
-                });
-              }
-
-              const urlButtonComponents = parseTemplateUrlButtonParameters(templateOptions.urlButtonParameters).map((override) => ({
-                type: 'button',
-                sub_type: 'url',
-                index: override.index,
-                parameters: override.parameters,
-              }));
-
-              const rawTemplateComponents = parseTemplateComponents(templateOptions.templateComponents);
-              let mergedTemplateComponents = mergeTemplateComponents(
-                templateComponentsForOverrides,
-                [...urlButtonComponents, ...rawTemplateComponents],
-              );
-
-              if (templateOptions.allowButtonIdOverride) {
-                body.allowButtonIdOverride = true;
-                const overrides = parseTemplateQuickReplyOverrides(templateOptions.quickReplyPayloadOverrides);
-                const overrideEntries = Object.entries(overrides);
-
-                if (overrideEntries.length > 0) {
-                  body.quickReplyPayloadOverrides = Object.fromEntries(
-                    overrideEntries.map(([index, payload]) => [String(index), String(payload)]),
-                  );
-                }
-
-                if (overrideEntries.length > 0) {
-                  const quickReplyComponents = overrideEntries.map(([index, payload]) => ({
-                    type: 'button',
-                    sub_type: 'quick_reply',
-                    index,
-                    parameters: [{ type: 'payload', payload }],
-                  }));
-
-                  mergedTemplateComponents = mergeTemplateComponents(
-                    mergedTemplateComponents,
-                    quickReplyComponents,
-                  );
-                }
-              }
-
-              if (mergedTemplateComponents.length > 0) {
-                body.template = {
-                  name: body.templateName,
-                  language: {
-                    code: body.language,
-                    policy: 'deterministic',
-                  },
-                  components: mergedTemplateComponents,
-                };
-              }
-            } else if (messageType === 'interactive') {
-              // Build interactive message from structured fields
-              const interactiveType = this.getNodeParameter('interactiveType', i) as string;
-              const bodyText = this.getNodeParameter('interactiveBodyText', i) as string;
-              const headerType = this.getNodeParameter('interactiveHeaderType', i, 'none') as string;
-              const headerText = this.getNodeParameter('interactiveHeaderText', i, '') as string;
-              const headerMediaUrl = this.getNodeParameter('interactiveHeaderMediaUrl', i, '') as string;
-              const footerText = this.getNodeParameter('interactiveFooterText', i, '') as string;
-
-              // Build buttons array
-              let buttons: Array<{ title: string; id?: string }> = [];
-              if (interactiveType === 'button') {
-                const buttonsData = this.getNodeParameter('interactiveButtons', i, { buttonValues: [] }) as {
-                  buttonValues?: Array<{ title: string; id?: string }>;
-                };
-                buttons = buttonsData.buttonValues || [];
-              }
-
-              // Build sections array
-              let sections: Array<{ title?: string; rows: Array<{ title: string; description?: string; id?: string }> }> = [];
-              let listButtonText = '';
-              if (interactiveType === 'list') {
-                listButtonText = this.getNodeParameter('interactiveListButtonText', i, 'Ver Opciones') as string;
-                const sectionsData = this.getNodeParameter('interactiveSections', i, { sectionValues: [] }) as {
-                  sectionValues?: Array<{
-                    title?: string;
-                    rows?: { rowValues?: Array<{ title: string; description?: string; id?: string }> };
-                  }>;
-                };
-
-                if (sectionsData.sectionValues) {
-                  sections = sectionsData.sectionValues.map((section) => ({
-                    title: section.title,
-                    rows: section.rows?.rowValues || [],
-                  }));
-                }
-              }
-
-              // CTA URL button
-              let ctaButtonText = '';
-              let ctaButtonUrl = '';
-              if (interactiveType === 'cta_url') {
-                ctaButtonText = this.getNodeParameter('ctaButtonText', i, '') as string;
-                ctaButtonUrl = this.getNodeParameter('ctaButtonUrl', i, '') as string;
-              }
-
-              body.interactive = buildInteractivePayload({
-                interactiveType,
-                bodyText,
-                headerType,
-                headerText,
-                headerMediaUrl,
-                footerText,
-                buttons,
-                listButtonText,
-                sections,
-                ctaButtonText,
-                ctaButtonUrl,
-              });
-            } else if (messageType === 'location') {
-              const locationName = this.getNodeParameter('locationName', i, '') as string;
-              const locationAddress = this.getNodeParameter('locationAddress', i, '') as string;
-              body.location = {
-                latitude: this.getNodeParameter('latitude', i) as number,
-                longitude: this.getNodeParameter('longitude', i) as number,
-                name: locationName || undefined,
-                address: locationAddress || undefined,
-              };
-            } else if (messageType === 'contacts') {
-              const contactsData = this.getNodeParameter('contactsData', i) as string;
-              body.contacts = typeof contactsData === 'string' ? JSON.parse(contactsData) : contactsData;
-            } else if (messageType === 'reaction') {
-              body.reaction = {
-                message_id: this.getNodeParameter('reactionMessageId', i) as string,
-                emoji: this.getNodeParameter('reactionEmoji', i) as string,
-              };
-            }
-
-            // Add additional fields
-            const additionalFields = this.getNodeParameter('additionalFields', i, {}) as Record<string, any>;
-            if (additionalFields.pauseAi) {
-              body.ai = body.ai || {};
-              body.ai.pause = additionalFields.pauseAi;
-            }
-            if (additionalFields.pauseDuration) {
-              body.ai = body.ai || {};
-              body.ai.pauseDuration = additionalFields.pauseDuration;
-            }
-            if (additionalFields.disableAi) {
-              body.ai = body.ai || {};
-              body.ai.disable = additionalFields.disableAi;
-            }
-            if (additionalFields.replyTo) {
-              body.context = { message_id: additionalFields.replyTo };
-            }
-            if (additionalFields.createConversation !== undefined) {
-              body.createConversation = additionalFields.createConversation;
-            }
-            if (additionalFields.metadata) {
-              body.metadata = typeof additionalFields.metadata === 'string' 
-                ? JSON.parse(additionalFields.metadata) 
-                : additionalFields.metadata;
-            }
-
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/messages/v1`,
-              headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-              },
-              body,
-              json: true,
-            });
-          } else if (operation === 'retry') {
-            const messageId = this.getNodeParameter('messageId', i) as string;
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/messages/v1/${messageId}/retry`,
-              headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-              },
-              json: true,
-            });
-          }
-        }
-
-        // ===========================================
-        // CONVERSATION RESOURCE
-        // ===========================================
-        else if (resource === 'conversation') {
-          if (operation === 'list') {
-            const filters = this.getNodeParameter('conversationFilters', i, {}) as Record<string, any>;
-            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
-            const limit = this.getNodeParameter('limit', i, 20) as number;
-            const qs: Record<string, any> = {};
-            if (filters.search) qs.search = filters.search;
-            if (filters.status && filters.status !== 'all') qs.status = filters.status;
-
-            const items = await runListV1Paginated(this, {
-              url: `${baseUrl}/conversations/v1`,
-              qs,
-              returnAll,
-              limit,
-              itemIndex: i,
-            });
-            for (const item of items) returnData.push({ json: item });
-            listHandled = true;
-          } else if (operation === 'get') {
-            const conversationId = this.getNodeParameter('conversationId', i) as string;
-            response = await this.helpers.request({
-              method: 'GET',
-              url: `${baseUrl}/conversations/v1/${conversationId}`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'getByPhone') {
-            const phoneNumber = this.getNodeParameter('phoneNumber', i) as string;
-            response = await this.helpers.request({
-              method: 'GET',
-              url: `${baseUrl}/conversations/v1/by-phone/${encodeURIComponent(phoneNumber)}`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'getMessages') {
-            const conversationId = this.getNodeParameter('conversationId', i) as string;
-            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
-            const limit = this.getNodeParameter('limit', i, 50) as number;
-
-            const items = await runListV1Paginated(this, {
-              url: `${baseUrl}/conversations/v1/${conversationId}/messages`,
-              returnAll,
-              limit,
-              itemIndex: i,
-            });
-            for (const item of items) returnData.push({ json: item });
-            listHandled = true;
-          } else if (operation === 'close') {
-            const conversationId = this.getNodeParameter('conversationId', i) as string;
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/conversations/v1/${conversationId}/close`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'archive') {
-            const conversationId = this.getNodeParameter('conversationId', i) as string;
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/conversations/v1/${conversationId}/archive`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'markRead') {
-            const conversationId = this.getNodeParameter('conversationId', i) as string;
-            response = await this.helpers.request({
-              method: 'PATCH',
-              url: `${baseUrl}/conversations/v1/${conversationId}/mark-read`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'setAi') {
-            const conversationId = this.getNodeParameter('conversationId', i) as string;
-            const aiEnabled = this.getNodeParameter('aiEnabled', i) as boolean;
-            response = await this.helpers.request({
-              method: 'PATCH',
-              url: `${baseUrl}/conversations/v1/${conversationId}/ai`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body: { aiEnabled },
-              json: true,
-            });
-          } else if (operation === 'pauseAi') {
-            const conversationId = this.getNodeParameter('conversationId', i) as string;
-            const duration = this.getNodeParameter('pauseDurationConv', i) as number;
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/conversations/v1/${conversationId}/ai/pause`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body: { duration },
-              json: true,
-            });
-          } else if (operation === 'aiSuggest') {
-            const conversationId = this.getNodeParameter('conversationId', i) as string;
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/conversations/v1/${conversationId}/ai-suggest`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          }
-        }
-
-        // ===========================================
-        // AGENT RESOURCE
-        // ===========================================
-        else if (resource === 'agent') {
-          if (operation === 'toggle') {
-            const enabled = this.getNodeParameter('agentEnabled', i) as boolean;
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/agent/v1/toggle`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body: { enabled },
-              json: true,
-            });
-          } else if (operation === 'pause') {
-            const duration = this.getNodeParameter('agentPauseDuration', i) as number;
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/agent/v1/pause`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body: { duration },
-              json: true,
-            });
-          }
-        }
-
-        // ===========================================
-        // TEMPLATE RESOURCE
-        // ===========================================
-        else if (resource === 'template') {
-          if (operation === 'list') {
-            const filters = this.getNodeParameter('templateFilters', i, {}) as Record<string, any>;
-            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
-            const limit = this.getNodeParameter('limit', i, 50) as number;
-            const qs: Record<string, any> = {};
-            if (filters.status) qs.status = filters.status;
-
-            const items = await runListV1Paginated(this, {
-              url: `${baseUrl}/templates/v1`,
-              qs,
-              returnAll,
-              limit,
-              itemIndex: i,
-            });
-            for (const item of items) returnData.push({ json: item });
-            listHandled = true;
-          } else if (operation === 'get') {
-            const templateId = this.getNodeParameter('templateId', i) as string;
-            response = await this.helpers.request({
-              method: 'GET',
-              url: `${baseUrl}/templates/v1/${templateId}`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'getVariables') {
-            response = await this.helpers.request({
-              method: 'GET',
-              url: `${baseUrl}/templates/v1/variables`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'sync') {
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/templates/v1/sync`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          }
-        }
-
-        // ===========================================
-        // MEDIA RESOURCE
-        // ===========================================
-        else if (resource === 'media') {
-          if (operation === 'upload') {
-            const mediaType = this.getNodeParameter('mediaType', i) as string;
-            const binaryPropertyName = this.getNodeParameter('binaryPropertyName', i) as string;
-            const itemBinary = items[i].binary;
-
-            if (!itemBinary || !itemBinary[binaryPropertyName]) {
-              throw new NodeOperationError(
-                this.getNode(),
-                `Binary property "${binaryPropertyName}" not found. Attach a file first (for example with Read Binary File or HTTP Request Download).`,
-                { itemIndex: i },
-              );
-            }
-
-            const fileBuffer = await this.helpers.getBinaryDataBuffer(i, binaryPropertyName);
-            const binaryData = itemBinary[binaryPropertyName];
-            const binaryDataRaw = binaryData as Record<string, unknown>;
-            const mimeCandidates = [
-              binaryData.mimeType,
-              binaryDataRaw.mime_type,
-              binaryDataRaw.contentType,
-              binaryDataRaw.content_type,
-            ];
-            const resolvedMimeType = mimeCandidates.find(
-              (value) => typeof value === 'string' && value.trim().length > 0,
-            ) as string | undefined;
-            const normalizedMimeType = resolvedMimeType
-              ? resolvedMimeType.trim().split(';')[0].replace(/[^a-zA-Z0-9.+/-]/g, '')
-              : undefined;
-            const mimeTypeByMediaType: Record<string, string> = {
-              image: 'image/jpeg',
-              video: 'video/mp4',
-              audio: 'audio/mpeg',
-              document: 'application/pdf',
-              sticker: 'image/webp',
-            };
-            const isValidMimeType = (value: string) => /^[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+$/.test(value);
-            const finalMimeType = (normalizedMimeType && isValidMimeType(normalizedMimeType))
-              ? normalizedMimeType
-              : (mimeTypeByMediaType[mediaType] ?? 'application/octet-stream');
-            const extensionByMediaType: Record<string, string> = {
-              image: 'jpg',
-              video: 'mp4',
-              audio: 'mp3',
-              document: 'pdf',
-              sticker: 'webp',
-            };
-            const extensionCandidates = [
-              binaryData.fileExtension,
-              binaryDataRaw.fileExtension,
-              binaryDataRaw.file_extension,
-            ];
-            const resolvedExtension = extensionCandidates.find(
-              (value) => typeof value === 'string' && value.trim().length > 0,
-            ) as string | undefined;
-            const normalizedExtension = resolvedExtension
-              ? resolvedExtension.toLowerCase().replace(/[^a-z0-9]/g, '')
-              : extensionByMediaType[mediaType];
-            const baseFileName = (binaryData.fileName || `${mediaType}-upload`).trim();
-            const fileName = baseFileName.includes('.')
-              ? baseFileName
-              : `${baseFileName}.${normalizedExtension || 'bin'}`;
-
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/media/v1`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              formData: {
-                type: mediaType,
-                file: {
-                  value: fileBuffer,
-                  options: {
-                    filename: fileName,
-                    contentType: finalMimeType,
-                    knownLength: fileBuffer.length,
-                  },
-                },
-              },
-              json: true,
-            });
-          }
-        }
-
-        // ===========================================
-        // CONTACT RESOURCE
-        // ===========================================
-        else if (resource === 'contact') {
-          if (operation === 'list') {
-            const filters = this.getNodeParameter('contactFilters', i, {}) as Record<string, any>;
-            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
-            const limit = this.getNodeParameter('limit', i, 20) as number;
-            const qs: Record<string, any> = {};
-            Object.entries(filters).forEach(([key, value]) => {
-              if (value !== undefined && value !== '') {
-                qs[key === 'sortBy' ? 'sort_by' : key === 'sortOrder' ? 'sort_order' : key === 'funnelStageId' ? 'funnel_stage_id' : key] = value;
-              }
-            });
-
-            const items = await runListV1Paginated(this, {
-              url: `${baseUrl}/contacts/v1`,
-              qs,
-              returnAll,
-              limit,
-              itemIndex: i,
-            });
-            for (const item of items) returnData.push({ json: item });
-            listHandled = true;
-          } else if (operation === 'get') {
-            const lookupBy = this.getNodeParameter('contactLookupBy', i, 'id') as string;
-            let resolvedContactId: string;
-
-            if (lookupBy === 'phone') {
-              const phone = this.getNodeParameter('contactPhone_lookup', i) as string;
-              const checkResponse = await this.helpers.request({
-                method: 'GET',
-                url: `${baseUrl}/contacts/check-phone`,
-                headers: { 'Authorization': `Bearer ${apiKey}` },
-                qs: { phone },
-                json: true,
-              });
-
-              if (!checkResponse.exists || !checkResponse.contact) {
-                throw new NodeOperationError(
-                  this.getNode(),
-                  `No contact found with phone number: ${phone}`,
-                  { itemIndex: i },
-                );
-              }
-              resolvedContactId = checkResponse.contact.id;
-            } else {
-              resolvedContactId = this.getNodeParameter('contactId', i) as string;
-            }
-
-            // Always use the V1 endpoint for consistent response format
-            response = await this.helpers.request({
-              method: 'GET',
-              url: `${baseUrl}/contacts/v1/${resolvedContactId}`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'create') {
-            const name = this.getNodeParameter('contactName', i) as string;
-            const phoneNumber = this.getNodeParameter('contactPhone', i) as string;
-            const additional = this.getNodeParameter('contactAdditional', i, {}) as Record<string, any>;
-            const body: Record<string, any> = { name, phoneNumber };
-            if (additional.email) body.email = additional.email;
-            if (additional.tags) body.tags = additional.tags;
-            if (additional.customFields) {
-              body.customFields = typeof additional.customFields === 'string' 
-                ? JSON.parse(additional.customFields) 
-                : additional.customFields;
-            }
-            if (additional.metadata) {
-              body.metadata = typeof additional.metadata === 'string' 
-                ? JSON.parse(additional.metadata) 
-                : additional.metadata;
-            }
-
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/contacts/v1`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body,
-              json: true,
-            });
-          } else if (operation === 'update') {
-            const contactId = this.getNodeParameter('contactId', i) as string;
-            const updateFields = this.getNodeParameter('contactUpdateFields', i, {}) as Record<string, any>;
-            const body: Record<string, any> = {};
-            
-            // Map camelCase to snake_case for API compatibility
-            const fieldMapping: Record<string, string> = {
-              phoneNumber: 'phone_number',
-              funnelStageId: 'funnel_stage_id',
-              customFields: 'custom_fields',
-            };
-            
-            Object.entries(updateFields).forEach(([key, value]) => {
-              if (value !== undefined && value !== '') {
-                const mappedKey = fieldMapping[key] || key;
-                if (key === 'customFields') {
-                  body[mappedKey] = typeof value === 'string' ? JSON.parse(value) : value;
-                } else {
-                  body[mappedKey] = value;
-                }
-              }
-            });
-
-            response = await this.helpers.request({
-              method: 'PATCH',
-              url: `${baseUrl}/contacts/v1/${contactId}`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body,
-              json: true,
-            });
-          } else if (operation === 'delete') {
-            const contactId = this.getNodeParameter('contactId', i) as string;
-            response = await this.helpers.request({
-              method: 'DELETE',
-              url: `${baseUrl}/contacts/v1/${contactId}`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'search') {
-            const query = this.getNodeParameter('searchQuery', i) as string;
-            const options = this.getNodeParameter('searchOptions', i, {}) as Record<string, any>;
-            const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
-            const limit = this.getNodeParameter('limit', i, 20) as number;
-            const body: Record<string, any> = { query };
-            if (options.filters) {
-              body.filters = typeof options.filters === 'string' ? JSON.parse(options.filters) : options.filters;
-            }
-
-            const items = await runListV1Paginated(this, {
-              method: 'POST',
-              url: `${baseUrl}/contacts/v1/search`,
-              body,
-              returnAll,
-              limit,
-              itemIndex: i,
-            });
-            for (const item of items) returnData.push({ json: item });
-            listHandled = true;
-          } else if (operation === 'bulk') {
-            const bulkOperation = this.getNodeParameter('bulkOperation', i) as string;
-            const contacts = this.getNodeParameter('bulkContacts', i) as string;
-            const data = this.getNodeParameter('bulkData', i, '{}') as string;
-
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/contacts/v1/bulk`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body: {
-                operation: bulkOperation,
-                contacts: typeof contacts === 'string' ? JSON.parse(contacts) : contacts,
-                data: typeof data === 'string' ? JSON.parse(data) : data,
-              },
-              json: true,
-            });
-          } else if (operation === 'merge') {
-            const contactId = this.getNodeParameter('contactId', i) as string;
-            const mergeWith = this.getNodeParameter('mergeWithId', i) as string;
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/contacts/v1/${contactId}/merge`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body: { mergeWith },
-              json: true,
-            });
-          } else if (operation === 'getTags') {
-            response = await this.helpers.request({
-              method: 'GET',
-              url: `${baseUrl}/contacts/v1/tags`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'getFields') {
-            response = await this.helpers.request({
-              method: 'GET',
-              url: `${baseUrl}/contacts/v1/fields`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          }
-        }
-
-        // ===========================================
-        // FUNNEL RESOURCE
-        // ===========================================
-        else if (resource === 'funnel') {
-          if (operation === 'listStages') {
-            const returnAll = this.getNodeParameter('returnAll', i, true) as boolean;
-            const limit = this.getNodeParameter('limit', i, 100) as number;
-
-            const items = await runListV1Paginated(this, {
-              url: `${baseUrl}/funnel/v1/stages`,
-              returnAll,
-              limit,
-              itemIndex: i,
-              dataKeys: ['data', 'stages'],
-            });
-            for (const item of items) returnData.push({ json: item });
-            listHandled = true;
-          } else if (operation === 'getStage') {
-            const stageId = this.getNodeParameter('stageId', i) as string;
-            response = await this.helpers.request({
-              method: 'GET',
-              url: `${baseUrl}/funnel/v1/stages/${stageId}`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'createStage') {
-            const name = this.getNodeParameter('stageName', i) as string;
-            const options = this.getNodeParameter('stageOptions', i, {}) as Record<string, any>;
-            const body: Record<string, any> = { name };
-            if (options.position !== undefined) body.position = options.position;
-            if (options.color) body.color = options.color;
-            if (options.description) body.description = options.description;
-
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/funnel/v1/stages`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body,
-              json: true,
-            });
-          } else if (operation === 'updateStage') {
-            const stageId = this.getNodeParameter('stageId', i) as string;
-            const updateFields = this.getNodeParameter('stageUpdateFields', i, {}) as Record<string, any>;
-            const body: Record<string, any> = {};
-            Object.entries(updateFields).forEach(([key, value]) => {
-              if (value !== undefined && value !== '') {
-                body[key] = value;
-              }
-            });
-
-            response = await this.helpers.request({
-              method: 'PATCH',
-              url: `${baseUrl}/funnel/v1/stages/${stageId}`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body,
-              json: true,
-            });
-          } else if (operation === 'deleteStage') {
-            const stageId = this.getNodeParameter('stageId', i) as string;
-            response = await this.helpers.request({
-              method: 'DELETE',
-              url: `${baseUrl}/funnel/v1/stages/${stageId}`,
-              headers: { 'Authorization': `Bearer ${apiKey}` },
-              json: true,
-            });
-          } else if (operation === 'reorderStages') {
-            const stages = this.getNodeParameter('stagesOrder', i) as string;
-            response = await this.helpers.request({
-              method: 'PATCH',
-              url: `${baseUrl}/funnel/v1/stages/reorder`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body: { stages: typeof stages === 'string' ? JSON.parse(stages) : stages },
-              json: true,
-            });
-          } else if (operation === 'moveContact') {
-            const contactId = this.getNodeParameter('contactIdFunnel', i) as string;
-            const stageId = this.getNodeParameter('targetStageId', i) as string;
-            response = await this.helpers.request({
-              method: 'POST',
-              url: `${baseUrl}/funnel/v1/contacts/${contactId}/move`,
-              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-              body: { stage_id: stageId },
-              json: true,
-            });
-          }
-        }
-
-        if (!listHandled && response) {
-          returnData.push({ json: response });
-        }
-
-      } catch (error) {
-        if (this.continueOnFail()) {
-          returnData.push({ json: { error: (error as Error).message } });
-          continue;
-        }
-        throw error;
-      }
-    }
-
-    return [returnData];
+    return executeWhaapyOperation.call(this);
   }
 }

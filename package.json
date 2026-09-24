@@ -1,7 +1,7 @@
 {
   "name": "n8n-nodes-whaapy",
-  "version": "0.4.0",
-  "description": "n8n community node for Whaapy - WhatsApp Business API with AI",
+  "version": "0.5.0",
+  "description": "n8n community node for Whaapy - WhatsApp Business API with AI agents, contacts, funnel and broadcasts",
   "keywords": [
     "n8n-community-node-package",
     "n8n",
@@ -9,7 +9,9 @@
     "whatsapp",
     "whatsapp-business",
     "messaging",
-    "automation"
+    "automation",
+    "broadcast",
+    "crm"
   ],
   "license": "MIT",
   "homepage": "https://whaapy.com",
@@ -26,7 +28,6 @@
     "pnpm": ">=9.1"
   },
   "packageManager": "pnpm@9.1.4",
-  "main": "index.js",
   "scripts": {
     "preinstall": "npx only-allow pnpm",
     "build": "tsc && gulp build:icons",
@@ -37,7 +38,9 @@
     "prepublishOnly": "pnpm build && eslint -c .eslintrc.prepublish.js \"nodes/**/*.ts\" \"credentials/**/*.ts\""
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
   "n8n": {
     "n8nNodesApiVersion": 1,
@@ -50,6 +53,7 @@
     ]
   },
   "devDependencies": {
+    "@types/node": "^20",
     "@typescript-eslint/parser": "^7.15.0",
     "eslint": "^8.56.0",
     "eslint-plugin-n8n-nodes-base": "^1.16.1",
